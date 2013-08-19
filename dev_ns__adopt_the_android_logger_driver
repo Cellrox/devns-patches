@@ -1,0 +1,354 @@
+dev_ns: adopt the android logger driver
+
+Adds device namespace info to android logger entries and filters entries
+read by the device namespace in which the reader runs - so a process would
+only see logs from its own namespace.
+
+Adds an ioctl to android logger to select from which namespace log entries
+should be read. This is useful to allow host to filter events from specific
+namespace when reading from /dev/log/events.
+
+Changelog:
+[16-Aug-2013] v1 - initial version
+
+Change-Id: I09d4c5009c18d94d69cdd785e46c76d756477767
+Signed-off-by: Amir Goldstein <amir@cellrox.com>
+Signed-off-by: Oren Laadan <orenl@cellrox.com>
+
+diff --git a/drivers/staging/android/logger.c b/drivers/staging/android/logger.c
+index eb3d4ca..d43e516 100644
+--- a/drivers/staging/android/logger.c
++++ b/drivers/staging/android/logger.c
+@@ -25,6 +25,7 @@
+ #include <linux/poll.h>
+ #include <linux/slab.h>
+ #include <linux/time.h>
++#include <linux/dev_namespace.h>
+ #include "logger.h"
+ 
+ #include <asm/ioctls.h>
+@@ -47,6 +48,13 @@ struct logger_log {
+ 	size_t			size;	/* size of the log */
+ };
+ 
++/* logger_ver - returns reader ABI compatible version */
++#define logger_compat_ver(v)	((v) & 0x00FF)
++/* logger_ns_ver - returns reader ns aware version */
++#define logger_ns_ver(v)	((v) | 0x0100)
++/* logger_ns_info - returns true iff reader should get ns info */
++#define logger_ns_info(v)	((v) & 0x0100)
++
+ /*
+  * struct logger_reader - a logging device open for reading
+  *
+@@ -59,6 +67,7 @@ struct logger_reader {
+ 	size_t			r_off;	/* current read head offset */
+ 	bool			r_all;	/* reader can read all entries */
+ 	int			r_ver;	/* reader ABI version */
++	pid_t			r_initpid; /* filter by devns initpid */
+ };
+ 
+ /* logger_offset - returns index 'n' into the log via (optimized) modulus */
+@@ -133,10 +142,17 @@ static __u32 get_entry_msg_len(struct logger_log *log, size_t off)
+ 
+ static size_t get_user_hdr_len(int ver)
+ {
+-	if (ver < 2)
+-		return sizeof(struct user_logger_entry_compat);
+-	else
++	switch (ver) {
++	case logger_compat_ver(1):
++		return sizeof(struct user_logger_entry_compat_v1);
++	case logger_ns_ver(1):
++		return sizeof(struct user_logger_entry_compat_ns_v1);
++	case logger_compat_ver(2):
++		return sizeof(struct user_logger_entry_compat_v2);
++	case logger_ns_ver(2):
++	default:
+ 		return sizeof(struct logger_entry);
++	}
+ }
+ 
+ static ssize_t copy_header_to_user(int ver, struct logger_entry *entry,
+@@ -144,9 +160,15 @@ static ssize_t copy_header_to_user(int ver, struct logger_entry *entry,
+ {
+ 	void *hdr;
+ 	size_t hdr_len;
+-	struct user_logger_entry_compat v1;
+-
+-	if (ver < 2) {
++	struct user_logger_entry_compat_ns_v1 v1;
++
++	if (logger_compat_ver(ver) < 2) {
++		if (logger_ns_info(ver)) {
++			v1.ns_initpid  = entry->ns_initpid;
++			v1.ns_pid   = entry->ns_pid;
++			v1.ns_tid   = entry->ns_tid;
++			memcpy(v1.ns_tag, entry->ns_tag, DEV_NS_TAG_LEN);
++		}
+ 		v1.len      = entry->len;
+ 		v1.__pad    = 0;
+ 		v1.pid      = entry->pid;
+@@ -154,12 +176,15 @@ static ssize_t copy_header_to_user(int ver, struct logger_entry *entry,
+ 		v1.sec      = entry->sec;
+ 		v1.nsec     = entry->nsec;
+ 		hdr         = &v1;
+-		hdr_len     = sizeof(struct user_logger_entry_compat);
+ 	} else {
+ 		hdr         = entry;
+-		hdr_len     = sizeof(struct logger_entry);
+ 	}
+ 
++	hdr_len = get_user_hdr_len(ver);
++	if (!logger_ns_info(ver))
++		/* skip the ns info header part */
++		hdr = &((struct logger_entry *)hdr)->len;
++
+ 	return copy_to_user(buf, hdr, hdr_len);
+ }
+ 
+@@ -216,12 +241,15 @@ static ssize_t do_read_log_to_user(struct logger_log *log,
+ }
+ 
+ /*
+- * get_next_entry_by_uid - Starting at 'off', returns an offset into
++ * get_next_entry_by_ns_uid - Starting at 'off', returns an offset into
+  * 'log->buffer' which contains the first entry readable by 'euid'
++ * in namespace of 'initpid'
+  */
+-static size_t get_next_entry_by_uid(struct logger_log *log,
+-		size_t off, uid_t euid)
++static size_t get_next_entry_by_ns_uid(struct logger_log *log,
++		size_t off, pid_t initpid, bool all)
+ {
++	uid_t euid = current_euid();
++
+ 	while (off != log->w_off) {
+ 		struct logger_entry *entry;
+ 		struct logger_entry scratch;
+@@ -229,7 +257,8 @@ static size_t get_next_entry_by_uid(struct logger_log *log,
+ 
+ 		entry = get_entry_header(log, off, &scratch);
+ 
+-		if (entry->euid == euid)
++		if ((all || entry->euid == euid) &&
++		    (!initpid || entry->ns_initpid == initpid))
+ 			return off;
+ 
+ 		next_len = sizeof(struct logger_entry) + entry->len;
+@@ -289,9 +318,9 @@ start:
+ 
+ 	mutex_lock(&log->mutex);
+ 
+-	if (!reader->r_all)
+-		reader->r_off = get_next_entry_by_uid(log,
+-			reader->r_off, current_euid());
++	if (!reader->r_all || reader->r_initpid)
++		reader->r_off = get_next_entry_by_ns_uid(log,
++			reader->r_off, reader->r_initpid, reader->r_all);
+ 
+ 	/* is there still something to read or did we race? */
+ 	if (unlikely(log->w_off == reader->r_off)) {
+@@ -447,6 +476,7 @@ ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 			 unsigned long nr_segs, loff_t ppos)
+ {
+ 	struct logger_log *log = file_get_log(iocb->ki_filp);
++	struct dev_namespace *dev_ns = current_dev_ns();
+ 	size_t orig = log->w_off;
+ 	struct logger_entry header;
+ 	struct timespec now;
+@@ -454,8 +484,17 @@ ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
+ 
+ 	now = current_kernel_time();
+ 
+-	header.pid = current->tgid;
+-	header.tid = current->pid;
++	BUG_ON(!dev_ns);
++
++	header.ns_initpid = dev_ns_init_pid(dev_ns);
++	if (header.ns_initpid > 1)
++		strncpy(header.ns_tag, dev_ns->tag, DEV_NS_TAG_LEN);
++	else
++		header.ns_tag[0] = '\0';
++	header.ns_pid = task_tgid_nr(current);
++	header.ns_tid = task_pid_nr(current);
++	header.pid = task_tgid_vnr(current);
++	header.tid = task_pid_vnr(current);
+ 	header.sec = now.tv_sec;
+ 	header.nsec = now.tv_nsec;
+ 	header.euid = current_euid();
+@@ -527,16 +566,33 @@ static int logger_open(struct inode *inode, struct file *file)
+ 
+ 	if (file->f_mode & FMODE_READ) {
+ 		struct logger_reader *reader;
++		struct dev_namespace *dev_ns = current_dev_ns();
++
++		BUG_ON(!dev_ns);
++
++		if (file->f_flags & O_DIRECT && dev_ns != &init_dev_ns)
++			return -EPERM;
+ 
+ 		reader = kmalloc(sizeof(struct logger_reader), GFP_KERNEL);
+ 		if (!reader)
+ 			return -ENOMEM;
+ 
+ 		reader->log = log;
+-		reader->r_ver = 1;
++		reader->r_ver = logger_compat_ver(1);
+ 		reader->r_all = in_egroup_p(inode->i_gid) ||
+ 			capable(CAP_SYSLOG);
+ 
++		if (file->f_flags & O_DIRECT) {
++			/* open in raw mode from root ns without filtering */
++			/* but clear flag before __dentry_open() sees it */
++			reader->r_initpid = 0;
++			reader->r_ver = logger_ns_ver(1);
++			file->f_flags &= ~O_DIRECT;
++		} else {
++			/* open logger in initpid filtering mode */
++			reader->r_initpid = dev_ns_init_pid(dev_ns);
++		}
++
+ 		INIT_LIST_HEAD(&reader->list);
+ 
+ 		mutex_lock(&log->mutex);
+@@ -596,9 +652,9 @@ static unsigned int logger_poll(struct file *file, poll_table *wait)
+ 	poll_wait(file, &log->wq, wait);
+ 
+ 	mutex_lock(&log->mutex);
+-	if (!reader->r_all)
+-		reader->r_off = get_next_entry_by_uid(log,
+-			reader->r_off, current_euid());
++	if (!reader->r_all || reader->r_initpid)
++		reader->r_off = get_next_entry_by_ns_uid(log,
++			reader->r_off, reader->r_initpid, reader->r_all);
+ 
+ 	if (log->w_off != reader->r_off)
+ 		ret |= POLLIN | POLLRDNORM;
+@@ -616,7 +672,11 @@ static long logger_set_version(struct logger_reader *reader, void __user *arg)
+ 	if ((version < 1) || (version > 2))
+ 		return -EINVAL;
+ 
+-	reader->r_ver = version;
++	if (reader->r_initpid)
++		reader->r_ver = logger_compat_ver(version);
++	else
++		reader->r_ver = logger_ns_ver(version);
++
+ 	return 0;
+ }
+ 
+@@ -651,9 +711,10 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 		}
+ 		reader = file->private_data;
+ 
+-		if (!reader->r_all)
+-			reader->r_off = get_next_entry_by_uid(log,
+-				reader->r_off, current_euid());
++		if (!reader->r_all || reader->r_initpid)
++			reader->r_off = get_next_entry_by_ns_uid(log,
++				reader->r_off, reader->r_initpid,
++				reader->r_all);
+ 
+ 		if (log->w_off != reader->r_off)
+ 			ret = get_user_hdr_len(reader->r_ver) +
+@@ -677,7 +738,7 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			break;
+ 		}
+ 		reader = file->private_data;
+-		ret = reader->r_ver;
++		ret = logger_compat_ver(reader->r_ver);
+ 		break;
+ 	case LOGGER_SET_VERSION:
+ 		if (!(file->f_mode & FMODE_READ)) {
+@@ -687,6 +748,29 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 		reader = file->private_data;
+ 		ret = logger_set_version(reader, argp);
+ 		break;
++	case LOGGER_SET_DEV_NS_FILTER:
++		if (!(file->f_mode & FMODE_READ)) {
++			ret = -EBADF;
++			break;
++		}
++		if (current_dev_ns() != &init_dev_ns) {
++			ret = -EPERM;
++			break;
++		}
++		if ((pid_t) arg < 0) {  /* 0 for no filtering */
++			ret = -EINVAL;
++			break;
++		}
++		reader = file->private_data;
++		reader->r_initpid = (pid_t) arg;
++		if (arg)
++			reader->r_ver = logger_compat_ver(reader->r_ver);
++		else
++			reader->r_ver = logger_ns_ver(reader->r_ver);
++		pr_info("logger: set ns filter to %lu, ver=%x\n",
++			arg, reader->r_ver);
++		ret = 0;
++		break;
+ 	}
+ 
+ 	mutex_unlock(&log->mutex);
+diff --git a/drivers/staging/android/logger.h b/drivers/staging/android/logger.h
+index 3f612a3..3607aeb 100644
+--- a/drivers/staging/android/logger.h
++++ b/drivers/staging/android/logger.h
+@@ -25,7 +25,7 @@
+  * This structure is returned to userspace unless the caller requests
+  * an upgrade to a newer ABI version.
+  */
+-struct user_logger_entry_compat {
++struct user_logger_entry_compat_v1 {
+ 	__u16		len;	/* length of the payload */
+ 	__u16		__pad;	/* no matter what, we get 2 bytes of padding */
+ 	__s32		pid;	/* generating process's pid */
+@@ -40,7 +40,40 @@ struct user_logger_entry_compat {
+  * This structure is returned to userspace if ioctl(LOGGER_SET_VERSION)
+  * is called with version >= 2
+  */
++struct user_logger_entry_compat_v2 {
++	__u16		len;		/* length of the payload */
++	__u16		hdr_size;	/* sizeof(struct logger_entry_v2) */
++	__s32		pid;		/* generating process's pid */
++	__s32		tid;		/* generating process's tid */
++	__s32		sec;		/* seconds since Epoch */
++	__s32		nsec;		/* nanoseconds */
++	uid_t		euid;		/* effective UID of logger */
++	char		msg[0];		/* the entry's payload */
++};
++
++#define DEV_NS_TAG_LEN 4  /* see dev_namespace.h */
++
++/* The structure for version 1 of the namespace-aware logger_entry ABI */
++struct user_logger_entry_compat_ns_v1 {
++	__s32		ns_initpid;/* generating process's device ns initpid */
++	__s32		ns_pid;	/* generating process's real pid */
++	__s32		ns_tid;	/* generating process's real tid */
++	char		ns_tag[DEV_NS_TAG_LEN]; /* device ns identifier */
++	__u16		len;	/* length of the payload */
++	__u16		__pad;	/* no matter what, we get 2 bytes of padding */
++	__s32		pid;	/* generating process's pid */
++	__s32		tid;	/* generating process's tid */
++	__s32		sec;	/* seconds since Epoch */
++	__s32		nsec;	/* nanoseconds */
++	char		msg[0];	/* the entry's payload */
++};
++
++/* The structure for version 2 of the namespace-aware logger_entry ABI */
+ struct logger_entry {
++	__s32		ns_initpid;	/* generating process's devns initpid */
++	__s32		ns_pid;		/* generating process's real pid */
++	__s32		ns_tid;		/* generating process's real tid */
++	char		ns_tag[DEV_NS_TAG_LEN]; /* device ns identifier */
+ 	__u16		len;		/* length of the payload */
+ 	__u16		hdr_size;	/* sizeof(struct logger_entry_v2) */
+ 	__s32		pid;		/* generating process's pid */
+@@ -66,5 +99,6 @@ struct logger_entry {
+ #define LOGGER_FLUSH_LOG		_IO(__LOGGERIO, 4) /* flush log */
+ #define LOGGER_GET_VERSION		_IO(__LOGGERIO, 5) /* abi version */
+ #define LOGGER_SET_VERSION		_IO(__LOGGERIO, 6) /* abi version */
++#define LOGGER_SET_DEV_NS_FILTER	_IO(__LOGGERIO, 10) /* devns filter */
+ 
+ #endif /* _LINUX_LOGGER_H */

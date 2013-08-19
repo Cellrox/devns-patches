@@ -1,0 +1,128 @@
+dev_ns: adopt the backlight/lcd subsystem
+
+Adds device namespace awareness to backlight and lcd subsystem - so that
+changes to the brightness/power/contrast setttings can only be made from an
+active namespace.
+
+Changelog:
+[16-Aug-2013] v1 - initial version
+
+Change-Id: Ib1b68a50240ca6116620eed74e31407c7b9d1bd4
+Signed-off-by: Oren Laadan <orenl@cellrox.com>
+
+diff --git a/drivers/video/backlight/backlight.c b/drivers/video/backlight/backlight.c
+index bf5b1ec..1b95c8d 100644
+--- a/drivers/video/backlight/backlight.c
++++ b/drivers/video/backlight/backlight.c
+@@ -14,6 +14,7 @@
+ #include <linux/err.h>
+ #include <linux/fb.h>
+ #include <linux/slab.h>
++#include <linux/dev_namespace.h>
+ 
+ #ifdef CONFIG_PMAC_BACKLIGHT
+ #include <asm/backlight.h>
+@@ -121,6 +122,14 @@ static ssize_t backlight_store_power(struct device *dev,
+ 		return rc;
+ 
+ 	rc = -ENXIO;
++
++	if (!is_active_dev_ns(current_dev_ns())) {
++		printk(KERN_INFO "%s: not setting %s power to %ld from inactive devns\n",
++		       __func__, dev_name(dev), power);
++		rc = count;
++		goto out;
++	}
++
+ 	mutex_lock(&bd->ops_lock);
+ 	if (bd->ops) {
+ 		pr_debug("backlight: set power to %lu\n", power);
+@@ -132,6 +141,7 @@ static ssize_t backlight_store_power(struct device *dev,
+ 	}
+ 	mutex_unlock(&bd->ops_lock);
+ 
++ out:
+ 	return rc;
+ }
+ 
+@@ -156,6 +166,16 @@ static ssize_t backlight_store_brightness(struct device *dev,
+ 
+ 	rc = -ENXIO;
+ 
++	if (!is_active_dev_ns(current_dev_ns())) {
++		printk(KERN_INFO "%s: not setting %s brightness to %ld from inactive devns\n",
++		       __func__, dev_name(dev), brightness);
++		rc = count;
++		/* generate the backlight event in case user space was relying
++		 * on this to happen
++		 */
++		goto out;
++	}
++
+ 	mutex_lock(&bd->ops_lock);
+ 	if (bd->ops) {
+ 		if (brightness > bd->props.max_brightness)
+@@ -172,6 +192,7 @@ static ssize_t backlight_store_brightness(struct device *dev,
+ 
+ 	backlight_generate_event(bd, BACKLIGHT_UPDATE_SYSFS);
+ 
++ out:
+ 	return rc;
+ }
+ 
+diff --git a/drivers/video/backlight/lcd.c b/drivers/video/backlight/lcd.c
+index 79c1b0d..831b539 100644
+--- a/drivers/video/backlight/lcd.c
++++ b/drivers/video/backlight/lcd.c
+@@ -14,6 +14,7 @@
+ #include <linux/err.h>
+ #include <linux/fb.h>
+ #include <linux/slab.h>
++#include <linux/dev_namespace.h>
+ 
+ #if defined(CONFIG_FB) || (defined(CONFIG_FB_MODULE) && \
+ 			   defined(CONFIG_LCD_CLASS_DEVICE_MODULE))
+@@ -104,6 +105,13 @@ static ssize_t lcd_store_power(struct device *dev,
+ 	if (rc)
+ 		return rc;
+ 
++	if (!is_active_dev_ns(current_dev_ns())) {
++		printk(KERN_INFO "%s: not setting %s power to %d from inactive devns\n",
++		       __func__, dev_name(dev), power);
++		rc = count;
++		goto out;
++	}
++
+ 	mutex_lock(&ld->ops_lock);
+ 	if (ld->ops && ld->ops->set_power) {
+ 		pr_debug("lcd: set power to %lu\n", power);
+@@ -112,6 +120,7 @@ static ssize_t lcd_store_power(struct device *dev,
+ 	}
+ 	mutex_unlock(&ld->ops_lock);
+ 
++ out:
+ 	return rc;
+ }
+ 
+@@ -140,6 +149,13 @@ static ssize_t lcd_store_contrast(struct device *dev,
+ 	if (rc)
+ 		return rc;
+ 
++	if (!is_active_dev_ns(current_dev_ns())) {
++		printk(KERN_INFO "%s: not setting %s contrast to %d from inactive devn.\n",
++		       __func__, dev_name(dev), contrast);
++		rc = count;
++		goto out;
++	}
++
+ 	mutex_lock(&ld->ops_lock);
+ 	if (ld->ops && ld->ops->set_contrast) {
+ 		pr_debug("lcd: set contrast to %lu\n", contrast);
+@@ -148,6 +164,7 @@ static ssize_t lcd_store_contrast(struct device *dev,
+ 	}
+ 	mutex_unlock(&ld->ops_lock);
+ 
++ out:
+ 	return rc;
+ }
+ 

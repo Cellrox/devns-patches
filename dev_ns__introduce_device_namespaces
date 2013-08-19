@@ -1,0 +1,1009 @@
+dev_ns: introduce device namespaces
+
+Introduce device namespaces:
+
+The idea with a device namespace comes from the Android-Cells project where
+namespaces are utilized to create a container-like environment on Linux, only
+where there's a notion of an 'active' namespace and all other namespaces are
+inactive. In such a case only processes residing within the active device
+namespace should communicate with actual devices, where processes inside
+inactive containers should be able to communicate gracefully with the device
+driver, but not the device.
+
+Changelog:
+[16-Aug-2013] v1 - initial version
+
+Change-Id: I38ef9fdf76086794d42679f4ec05612ba0cfb179
+Signed-off-by: Oren Laadan <orenl@cellrox.com>
+Signed-off-by: Amir Goldstein <amir@cellrox.com>
+
+diff --git a/include/linux/dev_namespace.h b/include/linux/dev_namespace.h
+new file mode 100644
+index 0000000..7b26e90
+--- /dev/null
++++ b/include/linux/dev_namespace.h
+@@ -0,0 +1,247 @@
++/*
++ * include/linux/dev_namespace.h
++ *
++ * Copyright (c) 2011-2013 Cellrox Ltd. Certain portions are copyrighted by
++ * Columbia University. This program is free software licensed under the GNU
++ * General Public License Version 2 (GPL 2). You can distribute it and/or
++ * modify it under the terms of the GPL 2.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GPL 2 license for more details.
++ * The full GPL 2 License is included in this distribution in the file called
++ * COPYING
++ *
++ * Cellrox can be contacted at oss@cellrox.com
++ */
++
++#ifndef _LINUX_DEV_NS_H
++#define _LINUX_DEV_NS_H
++
++#include <linux/pid_namespace.h>
++#include <linux/nsproxy.h>
++#include <linux/notifier.h>
++#include <linux/hardirq.h>
++#include <linux/err.h>
++
++#ifdef __KERNEL__
++
++#define DEV_NS_TAG_LEN 4
++#define DEV_NS_DESC_MAX 16
++
++struct dev_namespace;
++struct dev_ns_info;
++
++struct dev_namespace {
++
++	bool active;
++	atomic_t count;
++	struct pid_namespace *pid_ns;
++	char tag[DEV_NS_TAG_LEN + 1];
++	struct blocking_notifier_head notifiers;
++	unsigned long timestamp; /* jiffies */
++
++	struct mutex mutex;
++	struct dev_ns_info *info[DEV_NS_DESC_MAX];
++};
++
++struct dev_ns_info {
++	struct dev_namespace *dev_ns;
++	struct list_head list;
++	struct notifier_block nb;
++	atomic_t count;
++};
++
++#ifdef CONFIG_DEV_NS
++
++struct dev_ns_ops {
++	struct dev_ns_info *(*create) (struct dev_namespace *dev_ns);
++	void (*release) (struct dev_ns_info *dev_ns_info);
++};
++
++/* device namespace notifications */
++#define DEV_NS_EVENT_ACTIVATE		0x1
++#define DEV_NS_EVENT_DEACTIVATE		0x2
++
++extern struct dev_namespace init_dev_ns;
++extern struct dev_namespace *active_dev_ns;
++
++extern void __put_dev_ns(struct dev_namespace *dev_ns);
++
++static inline void put_dev_ns(struct dev_namespace *dev_ns)
++{
++	if (atomic_dec_and_test(&dev_ns->count))
++		__put_dev_ns(dev_ns);
++}
++
++static inline struct dev_namespace *get_dev_ns(struct dev_namespace *dev_ns)
++{
++	atomic_inc(&dev_ns->count);
++	return dev_ns;
++}
++
++/* return the device namespaces of the current process */
++static inline struct dev_namespace *current_dev_ns(void)
++{
++	BUG_ON(in_interrupt());
++	return current->nsproxy->dev_ns;
++}
++
++/* return whether given device namespace is active */
++static inline bool is_active_dev_ns(struct dev_namespace *dev_ns)
++{
++	return dev_ns->active;
++}
++
++/* return and get the device namespace of a given task */
++extern struct dev_namespace *get_dev_ns_by_task(struct task_struct *task);
++extern struct dev_namespace *get_dev_ns_by_vpid(pid_t vpid);
++
++/*
++ * set_active_dev_ns() will lock and unlock dev_namespace_lock
++ * and call all registered activate and inactivate notifiers.
++ */
++extern void set_active_dev_ns(struct dev_namespace *dev_ns);
++
++/* return the tag of the current namespace */
++extern void get_dev_ns_tag(char *to, struct dev_namespace *dev);
++
++/* return root pid of the init process in a device namespace */
++static inline pid_t dev_ns_init_pid(struct dev_namespace *dev_ns)
++{
++	return dev_ns->pid_ns->child_reaper->pid;
++}
++
++/* device namespaces: notifiers (de)registration */
++extern void dev_ns_register_notify(struct dev_namespace *dev_ns,
++				   struct notifier_block *nb);
++extern void dev_ns_unregister_notify(struct dev_namespace *dev_ns,
++				     struct notifier_block *nb);
++
++extern struct dev_namespace *copy_dev_ns(unsigned long flags,
++					 struct task_struct *task);
++
++/* helpers for per-driver logic of device namespace */
++
++extern int register_dev_ns_ops(char *name, struct dev_ns_ops *ops);
++extern void unregister_dev_ns_ops(int ns_id);
++extern struct dev_ns_info *get_dev_ns_info(int ns_id,
++					   struct dev_namespace *dev_ns,
++					   bool lock, bool create);
++extern struct dev_ns_info *get_dev_ns_info_task(int ns_id,
++						struct task_struct *task);
++extern void put_dev_ns_info(int ns_id,
++			    struct dev_ns_info *dev_ns_info,
++			    int lock);
++extern void loop_dev_ns_info(int ns_id, void *ptr,
++			     void (*func)(struct dev_ns_info *dev_ns_info,
++					  void *ptr));
++
++/* macro-mania to reduce repetitive code - not for the faint of heart */
++
++#define i_to_x_dev_ns(i, x) container_of(i, struct x ## _dev_ns, dev_ns_info)
++
++#define _dev_ns_id(X) \
++	static int X ## _ns_id;
++
++#define _dev_ns_get(X) \
++	static inline \
++	struct X ## _dev_ns *get_ ## X ## _ns(struct dev_namespace *dev_ns) \
++	{ \
++		struct dev_ns_info *info; \
++		info = get_dev_ns_info(X ## _ns_id, dev_ns, 1, 1); \
++		return info ? i_to_x_dev_ns(info, X) : NULL; \
++	}
++
++#define _dev_ns_find(X) \
++	static inline \
++	struct X ## _dev_ns *find_ ## X ## _ns(struct dev_namespace *dev_ns) \
++	{ \
++		struct dev_ns_info *info; \
++		info = get_dev_ns_info(X ## _ns_id, dev_ns, 0, 0); \
++		return info ? i_to_x_dev_ns(info, X) : NULL; \
++	}
++
++
++#define _dev_ns_get_cur(X) \
++	static inline struct X ## _dev_ns *get_ ## X ## _ns_cur(void) \
++	{ \
++		struct dev_ns_info *info; \
++		info = get_dev_ns_info_task(X ## _ns_id, current); \
++		return info ? i_to_x_dev_ns(info, X) : NULL; \
++	}
++
++#define _dev_ns_put(X) \
++	static inline void put_ ## X ## _ns(struct X ## _dev_ns *X ## _ns) \
++	{ \
++		put_dev_ns_info(X ## _ns_id, &X ## _ns->dev_ns_info, 1); \
++	}
++
++/*
++ * Finally, this is what a driver author really needs to use:
++ * DEFINE_DEV_NS_INFO(X): X_ns_id, put_X_ns(), get_X_ns(), get_X_ns_cur()
++ * DEV_NS_REGISTER(X): will register X with device namespace
++ * DEV_NS_UNREGISTER(X): will unregister X from device namespace
++ */
++
++#define DEFINE_DEV_NS_INFO(X) \
++	_dev_ns_id(X) \
++	_dev_ns_find(X) \
++	_dev_ns_get(X) \
++	_dev_ns_get_cur(X) \
++	_dev_ns_put(X)
++
++#define DEV_NS_REGISTER(X, s) \
++	(X ## _ns_id = register_dev_ns_ops(s, &X ## _ns_ops))
++
++#define DEV_NS_UNREGISTER(X) \
++	unregister_dev_ns_ops(X ## _ns_id)
++
++
++#else  /* !CONFIG_DEV_NS */
++
++/* appease static assignment in kernel/nsproxy.c */
++#define init_dev_ns (*(struct dev_namespace *) NULL)
++
++/*
++ * Driver authors should use this macro instead if !CONFIG_DEV_NS:
++ * DEFINE_DEV_NS_INIT(X): put_X_ns(), get_X_ns(), get_X_ns_cur()
++ */
++#define DEFINE_DEV_NS_INIT(x) \
++	struct x ## _dev_ns init_ ## x ## _ns; \
++	static inline \
++	struct x ## _dev_ns *find_ ## x ## _ns(struct dev_namespace *dev_ns) \
++	{ return &init_ ## x ## _ns; } \
++	struct x ## _dev_ns *get_ ## x ## _ns(struct dev_namespace *dev_ns) \
++	{ return &init_ ## x ## _ns; } \
++	static inline struct x ## _dev_ns *get_ ## x ## _ns_cur(void) \
++	{ return &init_ ## x ## _ns; } \
++	static inline void put_ ## x ## _ns(struct x ## _dev_ns *x ## _ns) \
++	{ /* */ }
++
++static inline struct dev_namespace *current_dev_ns(void)
++{ return &init_dev_ns; }
++
++static inline struct dev_namespace *copy_dev_ns(unsigned long flags,
++						struct task_struct *task)
++{
++	if (flags & CLONE_NEWPID)
++		return ERR_PTR(-EINVAL);
++	return task->nsproxy->dev_ns;
++}
++
++static inline pid_t dev_ns_init_pid(struct dev_namespace *dev_ns)
++{
++	return init_task.pid;
++}
++
++static inline get_dev_ns_tag(char *to, struct dev_namespace *dev_ns)
++{
++	strcpy(to, "");
++}
++
++#endif /* CONFIG_DEV_NS */
++
++
++#endif /* __KERNEL__ */
++#endif /* _LINUX_DEV_NS_H */
+diff --git a/include/linux/nsproxy.h b/include/linux/nsproxy.h
+index cc37a55..bad297b 100644
+--- a/include/linux/nsproxy.h
++++ b/include/linux/nsproxy.h
+@@ -29,6 +29,7 @@ struct nsproxy {
+ 	struct mnt_namespace *mnt_ns;
+ 	struct pid_namespace *pid_ns;
+ 	struct net 	     *net_ns;
++	struct dev_namespace *dev_ns;
+ };
+ extern struct nsproxy init_nsproxy;
+ 
+diff --git a/init/Kconfig b/init/Kconfig
+index a7cffc8..9f1e2a3 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -850,6 +850,16 @@ config NET_NS
+ 	  Allow user space to create what appear to be multiple instances
+ 	  of the network stack.
+ 
++config DEV_NS
++	bool "Device Namespaces (EXPERIMENTAL)"
++	default n
++	depends on PID_NS
++	help
++	Support device driver namespaces. This allows drivers to multiplex
++	access to its physical or logical resources. A device namespace has
++	a one-to-one relationship with a PID namespace currentlly, but this
++	will likely change in the future.
++
+ endif # NAMESPACES
+ 
+ config SCHED_AUTOGROUP
+diff --git a/kernel/Makefile b/kernel/Makefile
+index cb41b95..e3f4aab 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -62,6 +62,7 @@ obj-$(CONFIG_CPUSETS) += cpuset.o
+ obj-$(CONFIG_UTS_NS) += utsname.o
+ obj-$(CONFIG_USER_NS) += user_namespace.o
+ obj-$(CONFIG_PID_NS) += pid_namespace.o
++obj-$(CONFIG_DEV_NS) += dev_namespace.o
+ obj-$(CONFIG_IKCONFIG) += configs.o
+ obj-$(CONFIG_RESOURCE_COUNTERS) += res_counter.o
+ obj-$(CONFIG_SMP) += stop_machine.o
+diff --git a/kernel/dev_namespace.c b/kernel/dev_namespace.c
+new file mode 100644
+index 0000000..9cf578d
+--- /dev/null
++++ b/kernel/dev_namespace.c
+@@ -0,0 +1,637 @@
++/*
++ * kernel/dev_namespace.c
++ *
++ * Copyright (c) 2011-2013 Cellrox Ltd. Certain portions are copyrighted by
++ * Columbia University. This program is free software licensed under the GNU
++ * General Public License Version 2 (GPL 2). You can distribute it and/or
++ * modify it under the terms of the GPL 2.
++ *
++ *
++ * Device namespaces:
++ *
++ * The idea with a device namespace comes from the Android-Cells project where
++ * namespaces are utilized to create a container-like environment on Linux, only
++ * where there's a notion of an 'active' namespace and all other namespaces are
++ * inactive. In such a case only processes residing within the active device
++ * namespace should communicate with actual devices, where processes inside
++ * inactive containers should be able to communicate gracefully with the device
++ * driver, but not the device.
++ *
++ * The device namespace allows a device driver to register itself and pass a
++ * pointer to its device specific namespace structure and register notifiers
++ * which are called when the active namepace becomes inactive and when an
++ * inactive namespace becomes active.
++ *
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GPL 2 license for more details.
++ * The full GPL 2 License is included in this distribution in the file called
++ * COPYING
++ *
++ * Cellrox can be contacted at oss@cellrox.com
++ */
++
++#include <linux/module.h>
++#include <linux/err.h>
++#include <linux/sched.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/seq_file.h>
++#include <linux/proc_fs.h>
++#include <linux/pid_namespace.h>
++#include <linux/dev_namespace.h>
++#include <linux/wakelock.h>
++#include <linux/kernel.h>
++#include <linux/atomic.h>
++#include <linux/uaccess.h>
++
++
++/* protects active namespace and switches */
++static DECLARE_RWSEM(global_dev_ns_lock);
++
++
++struct dev_namespace init_dev_ns = {
++	.active = true,
++	.count = ATOMIC_INIT(2),  /* extra reference for active_dev_ns */
++	.pid_ns = &init_pid_ns,
++	.notifiers = BLOCKING_NOTIFIER_INIT(init_dev_ns.notifiers),
++	.timestamp = 0,
++	.mutex = __MUTEX_INITIALIZER(init_dev_ns.mutex),
++};
++EXPORT_SYMBOL_GPL(init_dev_ns);
++
++
++struct dev_namespace *active_dev_ns = &init_dev_ns;
++
++
++static void dev_ns_lock(struct dev_namespace *dev_ns)
++{
++	mutex_lock(&dev_ns->mutex);
++}
++
++static void dev_ns_unlock(struct dev_namespace *dev_ns)
++{
++	mutex_unlock(&dev_ns->mutex);
++}
++
++static struct dev_namespace *create_dev_ns(struct task_struct *task)
++{
++	struct dev_namespace *dev_ns;
++
++	dev_ns = kzalloc(sizeof(struct dev_namespace), GFP_KERNEL);
++	if (!dev_ns)
++		return ERR_PTR(-ENOMEM);
++
++	atomic_set(&dev_ns->count, 1);
++	BLOCKING_INIT_NOTIFIER_HEAD(&dev_ns->notifiers);
++	mutex_init(&dev_ns->mutex);
++
++	dev_ns->pid_ns = get_pid_ns(task->nsproxy->pid_ns);
++
++	return dev_ns;
++}
++
++struct dev_namespace *copy_dev_ns(unsigned long flags,
++				  struct task_struct *task)
++{
++	struct dev_namespace *dev_ns = task->nsproxy->dev_ns;
++
++	/*
++	 * Couple device namespace semantics with pid-namespace.
++	 * It's convenient, and we ran out of clone flags anyway.
++	 */
++	if (!(flags & CLONE_NEWPID))
++		return get_dev_ns(dev_ns);
++	else
++		return create_dev_ns(task);
++}
++
++void __put_dev_ns(struct dev_namespace *dev_ns)
++{
++	if (dev_ns) {
++		put_pid_ns(dev_ns->pid_ns);
++		kfree(dev_ns);
++	}
++}
++
++struct dev_namespace *get_dev_ns_by_task(struct task_struct *task)
++{
++	struct dev_namespace *dev_ns = NULL;
++	struct nsproxy *nsproxy;
++
++	rcu_read_lock();
++	nsproxy = task_nsproxy(task);
++	if (nsproxy)
++		dev_ns = get_dev_ns(nsproxy->dev_ns);
++	rcu_read_unlock();
++
++	return dev_ns;
++}
++
++struct dev_namespace *get_dev_ns_by_vpid(pid_t vpid)
++{
++	struct dev_namespace *dev_ns = NULL;
++	struct task_struct *task;
++	struct nsproxy *nsproxy;
++
++	rcu_read_lock();
++	task = find_task_by_pid_ns(vpid, &init_pid_ns);
++	if (task) {
++		nsproxy = task_nsproxy(task);
++		if (nsproxy)
++			dev_ns = get_dev_ns(nsproxy->dev_ns);
++	}
++	rcu_read_unlock();
++
++	return dev_ns;
++}
++
++/**
++ * notifications: activate/deactive device namespace
++ */
++static BLOCKING_NOTIFIER_HEAD(dev_ns_notifiers);
++void dev_ns_register_notify(struct dev_namespace *dev_ns,
++			    struct notifier_block *nb)
++{
++	if (dev_ns != NULL)
++		blocking_notifier_chain_register(&dev_ns->notifiers, nb);
++	else
++		blocking_notifier_chain_register(&dev_ns_notifiers, nb);
++}
++
++void dev_ns_unregister_notify(struct dev_namespace *dev_ns,
++			      struct notifier_block *nb)
++{
++	if (dev_ns != NULL)
++		blocking_notifier_chain_unregister(&dev_ns->notifiers, nb);
++	else
++		blocking_notifier_chain_unregister(&dev_ns_notifiers, nb);
++}
++
++/*
++ * Helpers for per-driver logic of device-namepace
++ *
++ * Drivers should embed 'struct dev_ns_info' in driver-specific,
++ * per-device-namespace data, e.g.:
++ *
++ *   struct xxxx_namespace {
++ *     ... (data specific to xxxx)
++ *     struct dev_ns_info devns_info;
++ *   };
++ *
++ * Drivers should register a 'struct dev_ns_ops' with ->create()
++ * and ->release() methods, and keep an identifier (dev_ns_xxx_id),
++ * for use by device namespace generic code
++ *
++ * Drivers can iterate over per-driver data in all namespaces:
++ *   void loop_dev_ns_info(int dev_ns_id, void *ptr,
++ *              void (*func)(struct dev_ns_info *dev_ns_info, void *ptr))
++ *
++ * See include/linux/dev_namespace.h for helper macros to hide these details.
++ */
++
++struct dev_ns_desc {
++	char *name;
++	struct dev_ns_ops *ops;
++	struct list_head head;
++};
++
++static struct dev_ns_desc dev_ns_desc[DEV_NS_DESC_MAX];
++static DEFINE_SPINLOCK(dev_ns_desc_lock);
++
++int register_dev_ns_ops(char *name, struct dev_ns_ops *ops)
++{
++	struct dev_ns_desc *desc;
++	int n, ret = -ENOMEM;
++
++	if (!name)
++		return -EINVAL;
++
++	spin_lock(&dev_ns_desc_lock);
++	for (n = 0; n < DEV_NS_DESC_MAX; n++) {
++		desc = &dev_ns_desc[n];
++		if (!desc->name && ret < 0)
++			ret = n;
++		else if (desc->name && !strcmp(desc->name, name)) {
++			ret = -EBUSY;
++			break;
++		}
++	}
++	if (ret >= 0) {
++		pr_info("dev_ns: register info %s\n", name);
++		desc = &dev_ns_desc[ret];
++		desc->name = name;
++		desc->ops = ops;
++		INIT_LIST_HEAD(&desc->head);
++	}
++	spin_unlock(&dev_ns_desc_lock);
++
++	return ret;
++}
++
++void unregister_dev_ns_ops(int dev_ns_id)
++{
++	struct dev_ns_desc *desc = &dev_ns_desc[dev_ns_id];
++
++	spin_lock(&dev_ns_desc_lock);
++	pr_info("dev_ns: unregister desc %s\n", desc->name);
++	memset(&dev_ns_desc[dev_ns_id], 0, sizeof(*desc));
++	spin_unlock(&dev_ns_desc_lock);
++}
++
++/* this function is called with dev_ns_lock(dev_ns) held */
++static struct dev_ns_info *new_dev_ns_info(int dev_ns_id,
++					   struct dev_namespace *dev_ns)
++{
++	struct dev_ns_desc *desc = &dev_ns_desc[dev_ns_id];
++	struct dev_ns_info *dev_ns_info;
++
++	pr_debug("dev_ns: [0x%p] new info %s\n", dev_ns, desc->name);
++
++	dev_ns_info = desc->ops->create(dev_ns);
++	if (!dev_ns_info)
++		return NULL;
++
++	pr_debug("dev_ns: [0x%p] got info 0x%p\n", dev_ns, dev_ns_info);
++
++	dev_ns->info[dev_ns_id] = dev_ns_info;
++	dev_ns_info->dev_ns = get_dev_ns(dev_ns);
++	atomic_set(&dev_ns_info->count, 0);
++
++	spin_lock(&dev_ns_desc_lock);
++	list_add(&dev_ns_info->list, &desc->head);
++	spin_unlock(&dev_ns_desc_lock);
++
++	return dev_ns_info;
++}
++
++/* this function is called with dev_ns_lock(dev_ns) held */
++static void del_dev_ns_info(int dev_ns_id, struct dev_ns_info *dev_ns_info)
++{
++	struct dev_namespace *dev_ns = dev_ns_info->dev_ns;
++
++	pr_debug("dev_ns: [0x%p] destory info 0x%p\n", dev_ns, dev_ns_info);
++
++	spin_lock(&dev_ns_desc_lock);
++	list_del(&dev_ns_info->list);
++	dev_ns->info[dev_ns_id] = NULL;
++	spin_unlock(&dev_ns_desc_lock);
++
++	dev_ns_desc[dev_ns_id].ops->release(dev_ns_info);
++	put_dev_ns(dev_ns);
++}
++
++/*
++ * get_dev_ns_info() is intended for internal use only. It is exported only
++ * to enable the helper macros in dev_namepsace.h to work properly.
++ *
++ * @create tells whether to create a new instance if none is found already,
++ * or just return NULL.
++ *
++ * @lock tells whether the @dev_ns should be locked against concurrent
++ * changes, or the caller is the one responsible (in which case there is
++ * not even a need for an extra refefence count).
++ */
++struct dev_ns_info *get_dev_ns_info(int dev_ns_id,
++				    struct dev_namespace *dev_ns,
++				    bool lock, bool create)
++{
++	struct dev_ns_info *dev_ns_info;
++
++	if (lock) {
++		down_read(&global_dev_ns_lock);
++		dev_ns_lock(dev_ns);
++	}
++
++	dev_ns_info = dev_ns->info[dev_ns_id];
++
++	if (!dev_ns_info && create)
++		dev_ns_info = new_dev_ns_info(dev_ns_id, dev_ns);
++
++	if (dev_ns_info) {
++		pr_debug("dev_ns: [0x%p] get info 0x%p count %d+\n", dev_ns,
++			 dev_ns_info, atomic_read(&dev_ns_info->count));
++	}
++
++	if (dev_ns_info && lock)
++		atomic_inc(&dev_ns_info->count);
++
++	if (lock) {
++		dev_ns_unlock(dev_ns);
++		up_read(&global_dev_ns_lock);
++	}
++
++	return dev_ns_info;
++}
++
++struct dev_ns_info *get_dev_ns_info_task(int dev_ns_id, struct task_struct *tsk)
++{
++	struct dev_ns_info *dev_ns_info;
++	struct dev_namespace *dev_ns;
++
++	dev_ns = get_dev_ns_by_task(tsk);
++	dev_ns_info = dev_ns ? get_dev_ns_info(dev_ns_id, dev_ns, 1, 1) : NULL;
++	put_dev_ns(dev_ns);
++
++	return dev_ns_info;
++}
++
++void put_dev_ns_info(int dev_ns_id, struct dev_ns_info *dev_ns_info, int lock)
++{
++	struct dev_namespace *dev_ns;
++
++	/*
++	 * keep extra reference, or else the concluding dev_ns_unlock()
++	 * could theoretically execute after the last dev_ns_put()..
++	 */
++	dev_ns = get_dev_ns(dev_ns_info->dev_ns);
++
++	if (lock) {
++		down_read(&global_dev_ns_lock);
++		dev_ns_lock(dev_ns);
++	}
++
++	pr_debug("dev_ns: [0x%p] put info 0x%p count %d-\n", dev_ns,
++		 dev_ns_info, atomic_read(&dev_ns_info->count));
++	if (atomic_dec_and_test(&dev_ns_info->count))
++		del_dev_ns_info(dev_ns_id, dev_ns_info);
++
++	if (lock) {
++		dev_ns_unlock(dev_ns);
++		up_read(&global_dev_ns_lock);
++	}
++
++	put_dev_ns(dev_ns);
++}
++
++/*
++ * @dev_ns_id: id of device namespace subsystem
++ * @ptr: data pointer to be passed to callback
++ * @func: callback for each device namespace (atomic, must not sleep)
++ */
++void loop_dev_ns_info(int dev_ns_id, void *ptr,
++		      void (*func)(struct dev_ns_info *dev_ns_info, void *ptr))
++{
++	struct dev_ns_desc *desc;
++	struct dev_ns_info *dev_ns_info;
++
++	spin_lock(&dev_ns_desc_lock);
++	desc = &dev_ns_desc[dev_ns_id];
++	list_for_each_entry(dev_ns_info, &desc->head, list) {
++		pr_debug("dev_ns: loop info 0x%p (dev_ns 0x%p) of %s\n",
++			 dev_ns_info, dev_ns_info->dev_ns, desc->name);
++		(*func)(dev_ns_info, ptr);
++	}
++	spin_unlock(&dev_ns_desc_lock);
++}
++
++/**
++ * Set the active device namespace (will call registered notifiers to
++ * allow device drivers to make device specific context store/restore)
++ *
++ * @dev_ns: The new active device namespace
++ */
++void set_active_dev_ns(struct dev_namespace *next_ns)
++{
++	struct dev_namespace *prev_ns;
++
++	BUG_ON(next_ns == NULL);
++
++	down_write(&global_dev_ns_lock);
++
++	if (next_ns == active_dev_ns)
++		goto done;
++
++	pr_info("dev_ns: activate 0x%p\n", next_ns);
++
++	prev_ns = active_dev_ns;
++
++	/*
++	 * deactivate previous dev_ns:
++	 * - set active-state of previous dev_ns to false
++	 * - call previous dev_ns's notifiers with deactivate event
++	 * - call global notifiers with deactivate event
++	 */
++
++	dev_ns_lock(prev_ns);
++
++	prev_ns->active = false;
++	prev_ns->timestamp = jiffies;
++
++	(void) blocking_notifier_call_chain(&prev_ns->notifiers,
++					    DEV_NS_EVENT_DEACTIVATE, prev_ns);
++	(void) blocking_notifier_call_chain(&dev_ns_notifiers,
++					    DEV_NS_EVENT_DEACTIVATE, prev_ns);
++
++	dev_ns_unlock(prev_ns);
++
++	/*
++	 * activate next dev_ns:
++	 * - set active-state of next dev_ns to true
++	 * - call next dev_ns's notifiers with activate event
++	 * - call global notifiers with activate event
++	 */
++
++	dev_ns_lock(next_ns);
++
++	next_ns->active = true;
++	next_ns->timestamp = jiffies;
++
++	/* make the switch */
++	active_dev_ns = next_ns;
++
++	(void) blocking_notifier_call_chain(&next_ns->notifiers,
++					    DEV_NS_EVENT_ACTIVATE, next_ns);
++	(void) blocking_notifier_call_chain(&dev_ns_notifiers,
++					    DEV_NS_EVENT_ACTIVATE, next_ns);
++
++	dev_ns_unlock(next_ns);
++
++	get_dev_ns(next_ns);
++	put_dev_ns(prev_ns);
++
++	pr_info("dev_ns: activate 0x%p done\n", next_ns);
++ done:
++	up_write(&global_dev_ns_lock);
++}
++
++void get_dev_ns_tag(char *to, struct dev_namespace *dev_ns)
++{
++	/* buf must be at least sizeof(dev_ns->tag) in size */
++	to[DEV_NS_TAG_LEN] = '\0';
++	strncpy(to, dev_ns->tag, DEV_NS_TAG_LEN);
++}
++
++void set_dev_ns_tag(struct dev_namespace *dev_ns, char *from)
++{
++	dev_ns_lock(dev_ns);
++	strncpy(dev_ns->tag, from, DEV_NS_TAG_LEN);
++	dev_ns_unlock(dev_ns);
++}
++
++
++/**
++ * Setup for /proc/dev_ns
++ */
++
++static struct proc_dir_entry *proc_dev_ns_dir;
++
++struct proc_dir_entry *
++create_dev_ns_proc(const char *name, const struct file_operations *fops)
++{
++	struct proc_dir_entry *entry;
++	entry = proc_create(name, 0, proc_dev_ns_dir, fops);
++	return entry;
++}
++
++static int proc_active_ns_show(struct seq_file *seq, void *offset)
++{
++	down_read(&global_dev_ns_lock);
++	seq_printf(seq, "%d\n", dev_ns_init_pid(active_dev_ns));
++	up_read(&global_dev_ns_lock);
++	return 0;
++}
++
++static int proc_ns_tag_show(struct seq_file *seq, void *offset)
++{
++	down_read(&global_dev_ns_lock);
++	seq_printf(seq, "active: %d timestamp: %ld tag: %s\n",
++		   dev_ns_init_pid(active_dev_ns),
++		   active_dev_ns->timestamp,
++		   active_dev_ns->tag);
++	up_read(&global_dev_ns_lock);
++	return 0;
++}
++
++static bool dev_ns_proc_permission(void)
++{
++	return current_dev_ns() == &init_dev_ns;
++}
++
++static int proc_active_ns_open(struct inode *inode, struct file *file)
++{
++	if (!dev_ns_proc_permission())
++		return -EPERM;
++	return single_open(file, proc_active_ns_show, PDE(inode)->data);
++}
++
++static int proc_ns_tag_open(struct inode *inode, struct file *file)
++{
++	if (!dev_ns_proc_permission())
++		return -EPERM;
++	return single_open(file, proc_ns_tag_show, PDE(inode)->data);
++}
++
++static ssize_t dev_ns_proc_write(struct file *file,
++				 const char __user *buffer,
++				 size_t count, loff_t *ppos, int setactive)
++{
++	struct dev_namespace *dev_ns;
++	char strbuf[16]; /* 10 chars for 32-bit pid + ':' + 4 chars for tag */
++	char *pid_str, *tag_str;
++	pid_t new_pid = 0;
++
++	/* only init ns may change active ns */
++	if (!dev_ns_proc_permission())
++		return -EPERM;
++
++	if (count >= sizeof(strbuf) || count == 0)
++		return -EFAULT;
++
++	if (copy_from_user(strbuf, buffer, count))
++		return -EFAULT;
++
++	strbuf[count] = '\0';
++	pid_str = strim(strbuf);
++	tag_str = strchr(pid_str, ':');
++	if (tag_str)
++		*(tag_str++) = '\0';
++
++	if (kstrtoint(pid_str, 10, &new_pid) || !new_pid) {
++		pr_warning("dev_ns: bad PID format '%s'\n", pid_str);
++		return -EINVAL;
++	}
++
++	dev_ns = get_dev_ns_by_vpid(new_pid);
++	if (!dev_ns) {
++		pr_warning("dev_ns: non-existing PID %d\n", new_pid);
++		return -EINVAL;
++	}
++
++	if (setactive) {
++		set_active_dev_ns(dev_ns);
++	} else if (tag_str) {
++		/* set dev_ns tag if format was <pid>:<tag> */
++		/* (safe: last byte of tag always remains NULL) */
++		set_dev_ns_tag(dev_ns, tag_str);
++	} else {
++		pr_warning("dev_ns: bad PID:tag format '%s'\n", pid_str);
++		count = -EINVAL;
++	}
++
++	put_dev_ns(dev_ns);
++	return count;
++}
++
++static ssize_t proc_active_ns_write(struct file *file,
++				    const char __user *buffer,
++				    size_t count, loff_t *ppos)
++{
++	return dev_ns_proc_write(file, buffer, count, ppos, 1);
++}
++
++static ssize_t proc_ns_tag_write(struct file *file,
++				 const char __user *buffer,
++				 size_t count, loff_t *ppos)
++{
++	return dev_ns_proc_write(file, buffer, count, ppos, 0);
++}
++
++static const struct file_operations active_ns_fileops = {
++	.owner = THIS_MODULE,
++	.open = proc_active_ns_open,
++	.read = seq_read,
++	.write = proc_active_ns_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static const struct file_operations ns_tag_fileops = {
++	.owner = THIS_MODULE,
++	.open = proc_ns_tag_open,
++	.read = seq_read,
++	.write = proc_ns_tag_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++static __init int dev_namespace_init(void)
++{
++	struct proc_dir_entry *entry;
++
++	proc_dev_ns_dir = proc_mkdir("dev_ns", NULL);
++	if (!proc_dev_ns_dir)
++		return -ENOMEM;
++
++	entry = proc_create("active_ns_pid", 0644, proc_dev_ns_dir,
++			    &active_ns_fileops);
++	if (!entry)
++		goto out_fail_active_ns;
++
++	entry = proc_create("ns_tag", 0644, proc_dev_ns_dir,
++			    &ns_tag_fileops);
++	if (!entry)
++		goto out_fail_ns_tag;
++
++	return 0;
++
++out_fail_ns_tag:
++	remove_proc_entry("active_ns_pid", proc_dev_ns_dir);
++out_fail_active_ns:
++	remove_proc_entry("dev_ns", NULL);
++	return -ENOMEM;
++}
++
++device_initcall(dev_namespace_init);
+diff --git a/kernel/nsproxy.c b/kernel/nsproxy.c
+index b576f7f..08f1fb4 100644
+--- a/kernel/nsproxy.c
++++ b/kernel/nsproxy.c
+@@ -22,6 +22,7 @@
+ #include <linux/pid_namespace.h>
+ #include <net/net_namespace.h>
+ #include <linux/ipc_namespace.h>
++#include <linux/dev_namespace.h>
+ #include <linux/proc_fs.h>
+ #include <linux/file.h>
+ #include <linux/syscalls.h>
+@@ -39,6 +40,7 @@ struct nsproxy init_nsproxy = {
+ #ifdef CONFIG_NET
+ 	.net_ns	= &init_net,
+ #endif
++	.dev_ns = &init_dev_ns,
+ };
+ 
+ static inline struct nsproxy *create_nsproxy(void)
+@@ -96,8 +98,19 @@ static struct nsproxy *create_new_namespaces(unsigned long flags,
+ 		goto out_net;
+ 	}
+ 
++	new_nsp->dev_ns = copy_dev_ns(flags, tsk);
++	if (IS_ERR(new_nsp->dev_ns)) {
++		err = PTR_ERR(new_nsp->dev_ns);
++		goto out_dev;
++	}
++
++	new_nsp->dev_ns->pid_ns = new_nsp->pid_ns;
++
+ 	return new_nsp;
+ 
++out_dev:
++	if (new_nsp->net_ns)
++		put_net(new_nsp->net_ns);
+ out_net:
+ 	if (new_nsp->pid_ns)
+ 		put_pid_ns(new_nsp->pid_ns);
+@@ -175,6 +188,8 @@ void free_nsproxy(struct nsproxy *ns)
+ 	if (ns->pid_ns)
+ 		put_pid_ns(ns->pid_ns);
+ 	put_net(ns->net_ns);
++	if (ns->dev_ns)
++		put_dev_ns(ns->dev_ns);
+ 	kmem_cache_free(nsproxy_cachep, ns);
+ }
+ 

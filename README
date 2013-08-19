@@ -1,0 +1,18 @@
+Device namespaces are an extension to existing Linux kernel namespaces,
+developed by Cellrox as part of its Thinvisor technology for lightweight
+virtualization for mobile devices.
+
+Device namespaces are based on development done at Columbia University. Certain
+portions are copyrighted by Columbia University.
+
+Device namespaces create the illusion, for processes inside a namespace, that
+they interact exclusively with a set of device drivers, hiding the fact that
+there are other namespaces interacting with the same set of device drivers.
+
+Device namespaces also introduce the concept of an active namespace, which is
+a namespace with access to real devices/peripherals and with which the user
+interacts, and the concept of switching namespaces to allow users to interact
+with multiple namespaces, one at a time.
+
+For more information, see https://github.com/Cellrox/devns-patches/wiki
+

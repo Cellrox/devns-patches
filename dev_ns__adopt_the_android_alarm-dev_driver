@@ -1,0 +1,481 @@
+dev_ns: adopt the android alarm-dev driver
+
+Add device namespace logic to Android alarm-dev driver - so processes in a
+namespace would only see alarms in its own namespace.
+
+Place per-namespace data into struct alarm_dev_ns, and convert the driver
+to operate on the current process's context.
+
+The exception is an ioctl call with ANDROID_ALARM_SET_RTC, in which case
+the fact that the RTC setting changes must be communicated to all of the
+contexts (device namespaces) so it takes effect in each namespace. This is
+by calling the new propagate_alarm_time_change().
+
+Changelog:
+[16-Aug-2013] v1 - initial version
+
+Change-Id: I968989e23268d9510f40cf90b7c3366c03d4a226
+Signed-off-by: Oren Laadan <orenl@cellrox.com>
+Signed-off-by: Amir Goldstein <amir@cellrox.com>
+
+diff --git a/drivers/staging/android/alarm-dev.c b/drivers/staging/android/alarm-dev.c
+index e001fe5..ff2505b 100644
+--- a/drivers/staging/android/alarm-dev.c
++++ b/drivers/staging/android/alarm-dev.c
+@@ -24,12 +24,41 @@
+ #include <linux/uaccess.h>
+ #include <linux/alarmtimer.h>
+ #include <linux/wakelock.h>
++#include <linux/slab.h>
++#include <linux/dev_namespace.h>
+ #include "android_alarm.h"
+ 
+ #define ANDROID_ALARM_PRINT_INFO (1U << 0)
+ #define ANDROID_ALARM_PRINT_IO (1U << 1)
+ #define ANDROID_ALARM_PRINT_INT (1U << 2)
+ 
++struct alarm_dev_ns;
++
++struct devalarm {
++	union {
++		struct hrtimer hrt;
++		struct alarm alrm;
++	} u;
++	enum android_alarm_type type;
++
++	struct alarm_dev_ns *alarm_ns;
++};
++
++struct alarm_dev_ns {
++	int               alarm_opened;
++	spinlock_t        alarm_slock;
++	struct wake_lock  alarm_wake_lock;
++	wait_queue_head_t alarm_wait_queue;
++	uint32_t          alarm_pending;
++	uint32_t          alarm_enabled;
++	uint32_t          wait_pending;
++
++	struct devalarm   alarms[ANDROID_ALARM_TYPE_COUNT];
++	char wakelock_name[32];
++
++	struct dev_ns_info dev_ns_info;
++};
++
+ static int debug_mask = ANDROID_ALARM_PRINT_INFO;
+ module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
+ 
+@@ -48,23 +77,100 @@ module_param_named(debug_mask, debug_mask, int, S_IRUGO | S_IWUSR | S_IWGRP);
+ #define ANDROID_ALARM_SET_OLD               _IOW('a', 2, time_t) /* set alarm */
+ #define ANDROID_ALARM_SET_AND_WAIT_OLD      _IOW('a', 3, time_t)
+ 
+-static int alarm_opened;
+-static DEFINE_SPINLOCK(alarm_slock);
+-static struct wake_lock alarm_wake_lock;
+-static DECLARE_WAIT_QUEUE_HEAD(alarm_wait_queue);
+-static uint32_t alarm_pending;
+-static uint32_t alarm_enabled;
+-static uint32_t wait_pending;
++static void devalarm_alarms_init(struct devalarm *alarms);
+ 
+-struct devalarm {
+-	union {
+-		struct hrtimer hrt;
+-		struct alarm alrm;
+-	} u;
+-	enum android_alarm_type type;
++static void alarm_ns_initialize(struct alarm_dev_ns *alarm_ns)
++{
++	alarm_ns->alarm_slock = __SPIN_LOCK_UNLOCKED(alarm_ns->alarm_slock);
++	init_waitqueue_head(&alarm_ns->alarm_wait_queue);
++
++	alarm_ns->alarm_pending = 0;
++	alarm_ns->alarm_enabled = 0;
++	alarm_ns->wait_pending = 0;
++
++	devalarm_alarms_init(alarm_ns->alarms);
++
++#ifdef CONFIG_HAS_WAKELOCK
++#ifdef CONFIG_DEV_NS
++	/* encode device-namespace into wakelock to ensure uniqueness */
++	sprintf(alarm_ns->wakelock_name, "alarm[ns:%d]",
++		dev_ns_init_pid(current_dev_ns()));
++#else
++	sprintf(alarm_ns->wakelock_name, "alarm");
++#endif
++
++	wake_lock_init(&alarm_ns->alarm_wake_lock, WAKE_LOCK_SUSPEND,
++		       alarm_ns->wakelock_name);
++#endif
++}
++
++static void alarm_ns_destroy(struct alarm_dev_ns *alarm_ns)
++{
++#ifdef CONFIG_HAS_WAKELOCK
++	wake_lock_destroy(&alarm_ns->alarm_wake_lock);
++#endif
++}
++
++#ifdef CONFIG_DEV_NS
++
++/* alarm_ns_id, get_alarm_ns(), get_alarm_ns_cur(), put_alarm_ns() */
++DEFINE_DEV_NS_INFO(alarm)
++
++static struct dev_ns_info *alarm_ns_create(struct dev_namespace *dev_ns)
++{
++	struct alarm_dev_ns *alarm_ns;
++
++	alarm_ns = kzalloc(sizeof(*alarm_ns), GFP_KERNEL);
++	if (!alarm_ns)
++		return ERR_PTR(-ENOMEM);
++
++	alarm_ns_initialize(alarm_ns);
++
++	return &alarm_ns->dev_ns_info;
++}
++
++static void alarm_ns_release(struct dev_ns_info *dev_ns_info)
++{
++	struct alarm_dev_ns *alarm_ns;
++
++	alarm_ns = container_of(dev_ns_info, struct alarm_dev_ns, dev_ns_info);
++	alarm_ns_destroy(alarm_ns);
++	kfree(alarm_ns);
++}
++
++/*
++ * If the RTC is set in any namespace (via alarm_set_rtc), make sure
++ * the remaining namespaces are udpates suitably.
++ */
++
++static void update_alarm_time_change(struct alarm_dev_ns *alarm_ns);
++
++static void propagate_alarm_time_change_func(struct dev_ns_info *dev_ns_info,
++					     void *unused)
++{
++	struct alarm_dev_ns *alarm_ns;
++
++	alarm_ns = container_of(dev_ns_info, struct alarm_dev_ns, dev_ns_info);
++	update_alarm_time_change(alarm_ns);
++}
++
++static void propagate_alarm_time_change(void)
++{
++	loop_dev_ns_info(alarm_ns_id, NULL, propagate_alarm_time_change_func);
++}
++
++
++static struct dev_ns_ops alarm_ns_ops = {
++	.create = alarm_ns_create,
++	.release = alarm_ns_release,
+ };
+ 
+-static struct devalarm alarms[ANDROID_ALARM_TYPE_COUNT];
++#else
++
++/* init_alarm_ns, get_alarm_ns(), get_alarm_ns_cur(), put_alarm_ns() */
++DEFINE_DEV_NS_INIT(alarm)
++
++#endif /* CONFIG_DEV_NS */
+ 
+ 
+ static int is_wakeup(enum android_alarm_type type)
+@@ -103,6 +209,15 @@ static void devalarm_cancel(struct devalarm *alrm)
+ 		hrtimer_cancel(&alrm->u.hrt);
+ }
+ 
++static void update_alarm_time_change(struct alarm_dev_ns *alarm_ns)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
++	alarm_ns->alarm_pending |= ANDROID_ALARM_TIME_CHANGE_MASK;
++	wake_up(&alarm_ns->alarm_wait_queue);
++	spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
++}
+ 
+ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
+@@ -115,38 +230,50 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	struct rtc_device *rtc_dev;
+ 	enum android_alarm_type alarm_type = ANDROID_ALARM_IOCTL_TO_TYPE(cmd);
+ 	uint32_t alarm_type_mask = 1U << alarm_type;
++	struct alarm_dev_ns *alarm_ns;
++	bool opened = false;
+ 
+ 	if (alarm_type >= ANDROID_ALARM_TYPE_COUNT)
+ 		return -EINVAL;
+ 
++	alarm_ns = get_alarm_ns_cur();
++	if (!alarm_ns)
++		return -ENOMEM;
++
+ 	if (ANDROID_ALARM_BASE_CMD(cmd) != ANDROID_ALARM_GET_TIME(0)) {
+-		if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+-			return -EPERM;
++		if ((file->f_flags & O_ACCMODE) == O_RDONLY) {
++			rv = -EPERM;
++			goto err1;
++		}
++
+ 		if (file->private_data == NULL &&
+ 		    cmd != ANDROID_ALARM_SET_RTC) {
+-			spin_lock_irqsave(&alarm_slock, flags);
+-			if (alarm_opened) {
+-				spin_unlock_irqrestore(&alarm_slock, flags);
+-				return -EBUSY;
++			spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
++			if (alarm_ns->alarm_opened) {
++				spin_unlock_irqrestore(&alarm_ns->alarm_slock,
++						       flags);
++				rv = -EBUSY;
++				goto err1;
+ 			}
+-			alarm_opened = 1;
++			opened = true;
++			alarm_ns->alarm_opened = 1;
+ 			file->private_data = (void *)1;
+-			spin_unlock_irqrestore(&alarm_slock, flags);
++			spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
+ 		}
+ 	}
+ 
+ 	switch (ANDROID_ALARM_BASE_CMD(cmd)) {
+ 	case ANDROID_ALARM_CLEAR(0):
+-		spin_lock_irqsave(&alarm_slock, flags);
++		spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
+ 		pr_alarm(IO, "alarm %d clear\n", alarm_type);
+-		devalarm_try_to_cancel(&alarms[alarm_type]);
+-		if (alarm_pending) {
+-			alarm_pending &= ~alarm_type_mask;
+-			if (!alarm_pending && !wait_pending)
+-				wake_unlock(&alarm_wake_lock);
++		devalarm_try_to_cancel(&alarm_ns->alarms[alarm_type]);
++		if (alarm_ns->alarm_pending) {
++			alarm_ns->alarm_pending &= ~alarm_type_mask;
++			if (!alarm_ns->alarm_pending && !alarm_ns->wait_pending)
++				wake_unlock(&alarm_ns->alarm_wake_lock);
+ 		}
+-		alarm_enabled &= ~alarm_type_mask;
+-		spin_unlock_irqrestore(&alarm_slock, flags);
++		alarm_ns->alarm_enabled &= ~alarm_type_mask;
++		spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
+ 		break;
+ 
+ 	case ANDROID_ALARM_SET_OLD:
+@@ -166,33 +293,34 @@ static long alarm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			goto err1;
+ 		}
+ from_old_alarm_set:
+-		spin_lock_irqsave(&alarm_slock, flags);
++		spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
+ 		pr_alarm(IO, "alarm %d set %ld.%09ld\n", alarm_type,
+ 			new_alarm_time.tv_sec, new_alarm_time.tv_nsec);
+-		alarm_enabled |= alarm_type_mask;
+-		devalarm_start(&alarms[alarm_type],
++		alarm_ns->alarm_enabled |= alarm_type_mask;
++		devalarm_start(&alarm_ns->alarms[alarm_type],
+ 			timespec_to_ktime(new_alarm_time));
+-		spin_unlock_irqrestore(&alarm_slock, flags);
++		spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
+ 		if (ANDROID_ALARM_BASE_CMD(cmd) != ANDROID_ALARM_SET_AND_WAIT(0)
+ 		    && cmd != ANDROID_ALARM_SET_AND_WAIT_OLD)
+ 			break;
+ 		/* fall though */
+ 	case ANDROID_ALARM_WAIT:
+-		spin_lock_irqsave(&alarm_slock, flags);
++		spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
+ 		pr_alarm(IO, "alarm wait\n");
+-		if (!alarm_pending && wait_pending) {
+-			wake_unlock(&alarm_wake_lock);
+-			wait_pending = 0;
++		if (!alarm_ns->alarm_pending && alarm_ns->wait_pending) {
++			wake_unlock(&alarm_ns->alarm_wake_lock);
++			alarm_ns->wait_pending = 0;
+ 		}
+-		spin_unlock_irqrestore(&alarm_slock, flags);
+-		rv = wait_event_interruptible(alarm_wait_queue, alarm_pending);
++		spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
++		rv = wait_event_interruptible(alarm_ns->alarm_wait_queue,
++					      alarm_ns->alarm_pending);
+ 		if (rv)
+ 			goto err1;
+-		spin_lock_irqsave(&alarm_slock, flags);
+-		rv = alarm_pending;
+-		wait_pending = 1;
+-		alarm_pending = 0;
+-		spin_unlock_irqrestore(&alarm_slock, flags);
++		spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
++		rv = alarm_ns->alarm_pending;
++		alarm_ns->wait_pending = 1;
++		alarm_ns->alarm_pending = 0;
++		spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
+ 		break;
+ 	case ANDROID_ALARM_SET_RTC:
+ 		if (copy_from_user(&new_rtc_time, (void __user *)arg,
+@@ -207,10 +335,10 @@ from_old_alarm_set:
+ 			goto err1;
+ 		if (rtc_dev)
+ 			rv = rtc_set_time(rtc_dev, &new_rtc_tm);
+-		spin_lock_irqsave(&alarm_slock, flags);
+-		alarm_pending |= ANDROID_ALARM_TIME_CHANGE_MASK;
+-		wake_up(&alarm_wait_queue);
+-		spin_unlock_irqrestore(&alarm_slock, flags);
++		update_alarm_time_change(alarm_ns);
++#ifdef CONFIG_DEV_NS
++		propagate_alarm_time_change();
++#endif
+ 		if (rv < 0)
+ 			goto err1;
+ 		break;
+@@ -241,6 +369,8 @@ from_old_alarm_set:
+ 		goto err1;
+ 	}
+ err1:
++	if (!opened)
++		put_alarm_ns(alarm_ns);
+ 	return rv;
+ }
+ 
+@@ -254,32 +384,39 @@ static int alarm_release(struct inode *inode, struct file *file)
+ {
+ 	int i;
+ 	unsigned long flags;
++	struct alarm_dev_ns *alarm_ns;
++
++	alarm_ns = get_alarm_ns_cur();
+ 
+-	spin_lock_irqsave(&alarm_slock, flags);
++	spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
+ 	if (file->private_data != 0) {
+ 		for (i = 0; i < ANDROID_ALARM_TYPE_COUNT; i++) {
+ 			uint32_t alarm_type_mask = 1U << i;
+-			if (alarm_enabled & alarm_type_mask) {
++			if (alarm_ns->alarm_enabled & alarm_type_mask) {
+ 				pr_alarm(INFO, "alarm_release: clear alarm, "
+ 					"pending %d\n",
+-					!!(alarm_pending & alarm_type_mask));
+-				alarm_enabled &= ~alarm_type_mask;
++					!!(alarm_ns->alarm_pending &
++					   alarm_type_mask));
++				alarm_ns->alarm_enabled &= ~alarm_type_mask;
+ 			}
+-			spin_unlock_irqrestore(&alarm_slock, flags);
+-			devalarm_cancel(&alarms[i]);
+-			spin_lock_irqsave(&alarm_slock, flags);
++			spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
++			devalarm_cancel(&alarm_ns->alarms[i]);
++			spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
+ 		}
+-		if (alarm_pending | wait_pending) {
+-			if (alarm_pending)
++		if (alarm_ns->alarm_pending | alarm_ns->wait_pending) {
++			if (alarm_ns->alarm_pending)
+ 				pr_alarm(INFO, "alarm_release: clear "
+-					"pending alarms %x\n", alarm_pending);
+-			wake_unlock(&alarm_wake_lock);
+-			wait_pending = 0;
+-			alarm_pending = 0;
++					 "pending alarms %x\n",
++					 alarm_ns->alarm_pending);
++			wake_unlock(&alarm_ns->alarm_wake_lock);
++			alarm_ns->wait_pending = 0;
++			alarm_ns->alarm_pending = 0;
+ 		}
+-		alarm_opened = 0;
++		alarm_ns->alarm_opened = 0;
++		put_alarm_ns(alarm_ns);  /* drop reference from open time */
+ 	}
+-	spin_unlock_irqrestore(&alarm_slock, flags);
++	spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
++	put_alarm_ns(alarm_ns);
+ 	return 0;
+ }
+ 
+@@ -287,16 +424,17 @@ static void devalarm_triggered(struct devalarm *alarm)
+ {
+ 	unsigned long flags;
+ 	uint32_t alarm_type_mask = 1U << alarm->type;
++	struct alarm_dev_ns *alarm_ns = alarm->alarm_ns;
+ 
+ 	pr_alarm(INT, "devalarm_triggered type %d\n", alarm->type);
+-	spin_lock_irqsave(&alarm_slock, flags);
+-	if (alarm_enabled & alarm_type_mask) {
+-		wake_lock_timeout(&alarm_wake_lock, 5 * HZ);
+-		alarm_enabled &= ~alarm_type_mask;
+-		alarm_pending |= alarm_type_mask;
+-		wake_up(&alarm_wait_queue);
++	spin_lock_irqsave(&alarm_ns->alarm_slock, flags);
++	if (alarm_ns->alarm_enabled & alarm_type_mask) {
++		wake_lock_timeout(&alarm_ns->alarm_wake_lock, 5 * HZ);
++		alarm_ns->alarm_enabled &= ~alarm_type_mask;
++		alarm_ns->alarm_pending |= alarm_type_mask;
++		wake_up(&alarm_ns->alarm_wait_queue);
+ 	}
+-	spin_unlock_irqrestore(&alarm_slock, flags);
++	spin_unlock_irqrestore(&alarm_ns->alarm_slock, flags);
+ }
+ 
+ 
+@@ -331,15 +469,12 @@ static struct miscdevice alarm_device = {
+ 	.fops = &alarm_fops,
+ };
+ 
+-static int __init alarm_dev_init(void)
++static void devalarm_alarms_init(struct devalarm *alarms)
+ {
+-	int err;
++	struct alarm_dev_ns *alarm_ns =
++		container_of(alarms, struct alarm_dev_ns, alarms[0]);
+ 	int i;
+ 
+-	err = misc_register(&alarm_device);
+-	if (err)
+-		return err;
+-
+ 	alarm_init(&alarms[ANDROID_ALARM_RTC_WAKEUP].u.alrm,
+ 			ALARM_REALTIME, devalarm_alarmhandler);
+ 	hrtimer_init(&alarms[ANDROID_ALARM_RTC].u.hrt,
+@@ -353,19 +488,41 @@ static int __init alarm_dev_init(void)
+ 
+ 	for (i = 0; i < ANDROID_ALARM_TYPE_COUNT; i++) {
+ 		alarms[i].type = i;
++		alarms[i].alarm_ns = alarm_ns;
+ 		if (!is_wakeup(i))
+ 			alarms[i].u.hrt.function = devalarm_hrthandler;
+ 	}
+ 
+-	wake_lock_init(&alarm_wake_lock, WAKE_LOCK_SUSPEND, "alarm");
++}
+ 
++static int __init alarm_dev_init(void)
++{
++	int err;
++
++	err = misc_register(&alarm_device);
++	if (err)
++		return err;
++
++#ifdef CONFIG_DEV_NS
++	err = DEV_NS_REGISTER(alarm, "alarm");
++	if (err < 0) {
++		misc_deregister(&alarm_device);
++		return err;
++	}
++#else
++	alarm_ns_initialize(&init_alarm_ns);
++#endif
+ 	return 0;
+ }
+ 
+ static void  __exit alarm_dev_exit(void)
+ {
+ 	misc_deregister(&alarm_device);
+-	wake_lock_destroy(&alarm_wake_lock);
++#ifdef CONFIG_DEV_NS
++	DEV_NS_UNREGISTER(alarm);
++#else
++	alarm_ns_destroy(&init_alarm_ns);
++#endif
+ }
+ 
+ module_init(alarm_dev_init);

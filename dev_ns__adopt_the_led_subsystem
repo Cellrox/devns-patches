@@ -1,0 +1,36 @@
+dev_ns: adopt the led subsystem
+
+Adds device namespace awareness to LED subsystem - so changes to the brightness
+setttings can only be made from an active namespace.
+
+Changelog:
+[16-Aug-2013] v1 - initial version
+
+Change-Id: I7efbf17c9ef102b9b167b4fdec867bd76023f0bd
+Signed-off-by: Oren Laadan <orenl@cellrox.com>
+
+diff --git a/drivers/leds/led-class.c b/drivers/leds/led-class.c
+index 5bff843..d1c9f22 100644
+--- a/drivers/leds/led-class.c
++++ b/drivers/leds/led-class.c
+@@ -19,6 +19,7 @@
+ #include <linux/err.h>
+ #include <linux/ctype.h>
+ #include <linux/leds.h>
++#include <linux/dev_namespace.h>
+ #include "leds.h"
+ 
+ static struct class *leds_class;
+@@ -55,6 +56,12 @@ static ssize_t led_brightness_store(struct device *dev,
+ 	if (count == size) {
+ 		ret = count;
+ 
++		if (!is_active_dev_ns(current_dev_ns())) {
++			printk(KERN_INFO "led_brightness: not setting %s to %ld from inactive container.\n",
++			       dev_name(dev), state);
++			return ret;
++		}
++
+ 		if (state == LED_OFF)
+ 			led_trigger_remove(led_cdev);
+ 		led_set_brightness(led_cdev, state);

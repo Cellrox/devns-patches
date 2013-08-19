@@ -1,0 +1,514 @@
+dev_ns: adopt the input subsystem
+
+Adds device namespace logic to the input subsystem to multiplex inputs events
+between device namespaces (evdev, mousedev).
+
+Keep track of the device namespace of clients, and deliver input events only to
+those clients that belong to an active (foreground) namespace.  Thus, listeners
+in background namespaces are oblivious to such input.
+
+With evdev, input grab depends on the device namespace context. Only clients in
+an active namespace can really grab an input, and from an active namespace, grab
+operates as usual. From a background namespace, input grab is done virtually:
+if no other clients in same namespace have the grab, the operation succeeds and
+the client is marked as having the grab, but no action is taken. When another
+namepace becomes active, grabs are swapped: current real grabs are undone and
+instead become virtual, and virtual grabs are forced and become real.
+
+Changelog:
+[16-Aug-2013] v1 - initial version
+
+Change-Id: Ie6a6d192cfaabeb7b06cc5d12a5ac0576c4a45d0
+Signed-off-by: Oren Laadan <orenl@cellrox.com>
+Signed-off-by: Amir Goldstein <amir@cellrox.com>
+
+diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
+index a937438..ef46708 100644
+--- a/drivers/input/evdev.c
++++ b/drivers/input/evdev.c
+@@ -8,7 +8,23 @@
+  * the Free Software Foundation.
+  */
+ 
++#ifdef CONFIG_DEV_NS
++#define DEBUG
++#define DEV_NS_EVDEV_DEBUG
++
++#ifdef DEV_NS_EVDEV_DEBUG
++#define pr_fmt(fmt) \
++	"[%d] devns:evdev [%s:%d]: " fmt, \
++	current->pid, __func__, __LINE__
++#else
++#define pr_fmt(fmt) \
++	"[%d] devns:evdev: " fmt, current->pid
++#endif
++#endif /* CONFIG_DEV_NS */
++
++#ifndef pr_fmt
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#endif
+ 
+ #define EVDEV_MINOR_BASE	64
+ #define EVDEV_MINORS		32
+@@ -24,6 +40,10 @@
+ #include <linux/major.h>
+ #include <linux/device.h>
+ #include <linux/wakelock.h>
++#ifdef CONFIG_DEV_NS
++#include <linux/dev_namespace.h>
++#endif
++
+ #include "input-compat.h"
+ 
+ struct evdev {
+@@ -39,6 +59,10 @@ struct evdev {
+ 	bool exist;
+ };
+ 
++#ifdef CONFIG_DEV_NS
++struct evdev_dev_ns;
++#endif
++
+ struct evdev_client {
+ 	unsigned int head;
+ 	unsigned int tail;
+@@ -46,7 +70,12 @@ struct evdev_client {
+ 	spinlock_t buffer_lock; /* protects access to buffer, head and tail */
+ 	struct wake_lock wake_lock;
+ 	bool use_wake_lock;
+-	char name[28];
++	char name[44];
++#ifdef CONFIG_DEV_NS
++	struct evdev_dev_ns *evdev_ns;
++	struct list_head list;
++	bool grab;
++#endif
+ 	struct fasync_struct *fasync;
+ 	struct evdev *evdev;
+ 	struct list_head node;
+@@ -58,6 +87,162 @@ struct evdev_client {
+ static struct evdev *evdev_table[EVDEV_MINORS];
+ static DEFINE_MUTEX(evdev_table_mutex);
+ 
++/*
++ * Multiplex inputs events between device namespaces (evdev, mousedev).
++ *
++ * Keep track of the device namespace of clients, and deliver input events
++ * only to those clients that belong to an active (foreground) namespace.
++ * Thus, listeners in background namespaces are oblivious to such input.
++ *
++ * With evdev, input grab depends on the device namespace context. Only
++ * clients in an active namespace can really grab an input, and from an active
++ * namespace, grab operates as usual. From a background namespace, input grab
++ * is done virtually: if no other clients in same namespace have the grab, the
++ * operation succeeds and the client is marked as having the grab, but no
++ * action is taken. When another namepace becomes active, grabs are swapped:
++ * current real grabs are undone and instead become virtual, and virtual grabs
++ * are forced and become real.
++ */
++
++#ifdef CONFIG_DEV_NS
++struct evdev_dev_ns {
++	struct mutex mutex;
++	struct list_head clients;
++	struct dev_ns_info dev_ns_info;
++};
++
++/* evdev_ns_id, get_evdev_ns(), get_evdev_ns_cur(), put_evdev_ns() */
++DEFINE_DEV_NS_INFO(evdev)
++
++/* indicate whether an evdev client is in the foreground */
++static bool evdev_client_is_active(struct evdev_client *client)
++{
++	return is_active_dev_ns(client->evdev_ns->dev_ns_info.dev_ns);
++}
++
++static struct notifier_block evdev_ns_switch_notifier;
++static int evdev_grab(struct evdev *evdev, struct evdev_client *client);
++static int evdev_ungrab(struct evdev *evdev, struct evdev_client *client);
++
++/* evdev_ns helpers */
++static struct dev_ns_info *evdev_devns_create(struct dev_namespace *dev_ns)
++{
++	struct evdev_dev_ns *evdev_ns;
++	struct dev_ns_info *dev_ns_info;
++
++	evdev_ns = kzalloc(sizeof(*evdev_ns), GFP_KERNEL);
++	if (!evdev_ns)
++		return ERR_PTR(-ENOMEM);
++
++	mutex_init(&evdev_ns->mutex);
++	INIT_LIST_HEAD(&evdev_ns->clients);
++
++	pr_info("new evdev_dev_ns %p (d %p)\n", evdev_ns, dev_ns);
++
++	dev_ns_info = &evdev_ns->dev_ns_info;
++
++	dev_ns_info->nb = evdev_ns_switch_notifier;
++	dev_ns_register_notify(dev_ns, &dev_ns_info->nb);
++
++	return &evdev_ns->dev_ns_info;
++
++}
++
++static void evdev_devns_release(struct dev_ns_info *dev_ns_info)
++{
++	struct evdev_dev_ns *evdev_ns;
++
++	evdev_ns = container_of(dev_ns_info, struct evdev_dev_ns, dev_ns_info);
++
++	pr_info("del evdev_dev_ns %p (d %p)\n", evdev_ns, dev_ns_info->dev_ns);
++	dev_ns_unregister_notify(dev_ns_info->dev_ns, &dev_ns_info->nb);
++
++	kfree(evdev_ns);
++}
++
++static struct dev_ns_ops evdev_ns_ops = {
++	.create = evdev_devns_create,
++	.release = evdev_devns_release,
++};
++
++static int evdev_ns_track_client(struct evdev_client *client)
++{
++	struct evdev_dev_ns *evdev_ns;
++
++	evdev_ns = get_evdev_ns_cur();
++	if (!evdev_ns)
++		return -ENOMEM;
++
++	pr_info("track new client 0x%p in evdev_ns 0x%p (dev_ns 0x%p)\n",
++		client, evdev_ns, evdev_ns->dev_ns_info.dev_ns);
++
++	client->evdev_ns = evdev_ns;
++	client->grab = false;
++
++	mutex_lock(&evdev_ns->mutex);
++	list_add(&client->list, &evdev_ns->clients);
++	mutex_unlock(&evdev_ns->mutex);
++
++	return 0;
++}
++
++static void evdev_ns_untrack_client(struct evdev_client *client)
++{
++	struct evdev_dev_ns *evdev_ns;
++
++	evdev_ns = client->evdev_ns;
++
++	pr_info("untrack client 0x%p in evdev_ns 0x%p (dev_ns 0x%p)\n",
++		client, evdev_ns, evdev_ns->dev_ns_info.dev_ns);
++
++	mutex_lock(&evdev_ns->mutex);
++	list_del(&client->list);
++	mutex_unlock(&evdev_ns->mutex);
++
++	put_evdev_ns(evdev_ns);
++}
++
++/* dev_ns and resepctive fb_dev_ns protected by caller */
++static int evdev_ns_switch_callback(struct notifier_block *self,
++				    unsigned long action, void *data)
++{
++	struct dev_namespace *dev_ns = data;
++	struct evdev_dev_ns *evdev_ns;
++	struct evdev_client *client;
++
++	evdev_ns = find_evdev_ns(dev_ns);
++	WARN(evdev_ns == NULL, "devns 0x%p: no matching evdev_ns\n", dev_ns);
++
++	mutex_lock(&evdev_ns->mutex);
++	switch (action) {
++	case DEV_NS_EVENT_ACTIVATE:
++		list_for_each_entry(client, &evdev_ns->clients, list)
++		{
++			mutex_lock(&client->evdev->mutex);
++			if (client->grab)
++				evdev_grab(client->evdev, client);
++			mutex_unlock(&client->evdev->mutex);
++		}
++		break;
++	case DEV_NS_EVENT_DEACTIVATE:
++		list_for_each_entry(client, &evdev_ns->clients, list)
++		{
++			mutex_lock(&client->evdev->mutex);
++			if (client->evdev->grab == client)
++				evdev_ungrab(client->evdev, client);
++			mutex_unlock(&client->evdev->mutex);
++		}
++		break;
++	}
++	mutex_unlock(&evdev_ns->mutex);
++	return 0;
++}
++
++static struct notifier_block evdev_ns_switch_notifier = {
++	.notifier_call = evdev_ns_switch_callback,
++};
++#endif /* CONFIG_DEV_NS */
++
+ static void evdev_pass_event(struct evdev_client *client,
+ 			     struct input_event *event,
+ 			     ktime_t mono, ktime_t real)
+@@ -123,8 +308,13 @@ static void evdev_event(struct input_handle *handle,
+ 	if (client)
+ 		evdev_pass_event(client, &event, time_mono, time_real);
+ 	else
+-		list_for_each_entry_rcu(client, &evdev->client_list, node)
++		list_for_each_entry_rcu(client, &evdev->client_list, node) {
++#ifdef CONFIG_DEV_NS
++			if (!evdev_client_is_active(client))
++				continue;
++#endif
+ 			evdev_pass_event(client, &event, time_mono, time_real);
++		}
+ 
+ 	rcu_read_unlock();
+ 
+@@ -181,6 +371,9 @@ static int evdev_grab(struct evdev *evdev, struct evdev_client *client)
+ 	if (error)
+ 		return error;
+ 
++#ifdef CONFIG_DEV_NS
++	client->grab = true;
++#endif
+ 	rcu_assign_pointer(evdev->grab, client);
+ 
+ 	return 0;
+@@ -191,6 +384,9 @@ static int evdev_ungrab(struct evdev *evdev, struct evdev_client *client)
+ 	if (evdev->grab != client)
+ 		return  -EINVAL;
+ 
++#ifdef CONFIG_DEV_NS
++	client->grab = false;
++#endif
+ 	rcu_assign_pointer(evdev->grab, NULL);
+ 	synchronize_rcu();
+ 	input_release_device(&evdev->handle);
+@@ -271,6 +467,10 @@ static int evdev_release(struct inode *inode, struct file *file)
+ 		evdev_ungrab(evdev, client);
+ 	mutex_unlock(&evdev->mutex);
+ 
++#ifdef CONFIG_DEV_NS
++	evdev_ns_untrack_client(client);
++#endif
++
+ 	evdev_detach_client(evdev, client);
+ 	if (client->use_wake_lock)
+ 		wake_lock_destroy(&client->wake_lock);
+@@ -325,22 +525,38 @@ static int evdev_open(struct inode *inode, struct file *file)
+ 
+ 	client->bufsize = bufsize;
+ 	spin_lock_init(&client->buffer_lock);
+-	snprintf(client->name, sizeof(client->name), "%s-%d",
++	i = snprintf(client->name, sizeof(client->name), "%s-%d",
+ 			dev_name(&evdev->dev), task_tgid_vnr(current));
++#ifdef CONFIG_DEV_NS
++	/* uniquely identify evdev across device namespace */
++	snprintf(client->name + i, sizeof(client->name) - i, "[ns:%d]",
++		 dev_ns_init_pid(current_dev_ns()));
++#endif
+ 	client->evdev = evdev;
++
++#ifdef CONFIG_DEV_NS
++	error = evdev_ns_track_client(client);
++	if (error)
++		goto err_free_client;
++#endif
++
+ 	evdev_attach_client(evdev, client);
+ 
+ 	error = evdev_open_device(evdev);
+ 	if (error)
+-		goto err_free_client;
++		goto err_detach_client;
+ 
+ 	file->private_data = client;
+ 	nonseekable_open(inode, file);
+ 
+ 	return 0;
+ 
+- err_free_client:
++ err_detach_client:
+ 	evdev_detach_client(evdev, client);
++#ifdef CONFIG_DEV_NS
++	evdev_ns_untrack_client(client);
++ err_free_client:
++#endif
+ 	kfree(client);
+  err_put_evdev:
+ 	put_device(&evdev->dev);
+@@ -374,6 +590,10 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
+ 		}
+ 		retval += input_event_size();
+ 
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client))
++			continue;
++#endif
+ 		input_inject_event(&evdev->handle,
+ 				   event.type, event.code, event.value);
+ 	} while (retval + input_event_size() <= count);
+@@ -739,12 +959,20 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+ 		if (get_user(v, ip + 1))
+ 			return -EFAULT;
+ 
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client))
++			return 0;
++#endif
+ 		input_inject_event(&evdev->handle, EV_REP, REP_DELAY, u);
+ 		input_inject_event(&evdev->handle, EV_REP, REP_PERIOD, v);
+ 
+ 		return 0;
+ 
+ 	case EVIOCRMFF:
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client))
++			return 0;
++#endif
+ 		return input_ff_erase(dev, (int)(unsigned long) p, file);
+ 
+ 	case EVIOCGEFFECTS:
+@@ -755,6 +983,15 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+ 		return 0;
+ 
+ 	case EVIOCGRAB:
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client)) {
++			if (p)
++				client->grab = true;
++			else
++				client->grab = false;
++			return 0;
++		} /* else */
++#endif
+ 		if (p)
+ 			return evdev_grab(evdev, client);
+ 		else
+@@ -772,6 +1009,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+ 		return evdev_handle_get_keycode(dev, p);
+ 
+ 	case EVIOCSKEYCODE:
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client))
++			return 0;
++#endif
+ 		return evdev_handle_set_keycode(dev, p);
+ 
+ 	case EVIOCGKEYCODE_V2:
+@@ -825,6 +1066,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+ 		return str_to_user(dev->uniq, size, p);
+ 
+ 	case EVIOC_MASK_SIZE(EVIOCSFF):
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client))
++			return 0;
++#endif
+ 		if (input_ff_effect_from_user(p, size, &effect))
+ 			return -EFAULT;
+ 
+@@ -865,6 +1110,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+ 
+ 	if (_IOC_DIR(cmd) == _IOC_WRITE) {
+ 
++#ifdef CONFIG_DEV_NS
++		if (!evdev_client_is_active(client))
++			return 0;
++#endif
+ 		if ((_IOC_NR(cmd) & ~ABS_MAX) == _IOC_NR(EVIOCSABS(0))) {
+ 
+ 			if (!dev->absinfo)
+@@ -1094,11 +1343,26 @@ static struct input_handler evdev_handler = {
+ 
+ static int __init evdev_init(void)
+ {
+-	return input_register_handler(&evdev_handler);
++	int ret;
++
++	ret = input_register_handler(&evdev_handler);
++	if (ret < 0)
++		return ret;
++#ifdef CONFIG_DEV_NS
++	ret = DEV_NS_REGISTER(evdev, "event dev");
++	if (ret < 0) {
++		input_unregister_handler(&evdev_handler);
++		return ret;
++	}
++#endif
++	return 0;
+ }
+ 
+ static void __exit evdev_exit(void)
+ {
++#ifdef CONFIG_DEV_NS
++	DEV_NS_UNREGISTER(evdev);
++#endif
+ 	input_unregister_handler(&evdev_handler);
+ }
+ 
+diff --git a/drivers/input/mousedev.c b/drivers/input/mousedev.c
+index 0110b5a..64f8cd6 100644
+--- a/drivers/input/mousedev.c
++++ b/drivers/input/mousedev.c
+@@ -25,6 +25,9 @@
+ #include <linux/major.h>
+ #include <linux/device.h>
+ #include <linux/kernel.h>
++#ifdef CONFIG_DEV_NS
++#include <linux/dev_namespace.h>
++#endif
+ #ifdef CONFIG_INPUT_MOUSEDEV_PSAUX
+ #include <linux/miscdevice.h>
+ #endif
+@@ -107,6 +110,10 @@ struct mousedev_client {
+ 	unsigned char imexseq, impsseq;
+ 	enum mousedev_emul mode;
+ 	unsigned long last_buttons;
++
++#ifdef CONFIG_DEV_NS
++	struct dev_namespace *dev_ns;
++#endif
+ };
+ 
+ #define MOUSEDEV_SEQ_LEN	6
+@@ -277,6 +284,10 @@ static void mousedev_notify_readers(struct mousedev *mousedev,
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(client, &mousedev->client_list, node) {
+ 
++#ifdef CONFIG_DEV_NS
++		if (!is_active_dev_ns(client->dev_ns))
++			continue;
++#endif
+ 		/* Just acquire the lock, interrupts already disabled */
+ 		spin_lock(&client->packet_lock);
+ 
+@@ -524,6 +535,9 @@ static int mousedev_release(struct inode *inode, struct file *file)
+ 	struct mousedev_client *client = file->private_data;
+ 	struct mousedev *mousedev = client->mousedev;
+ 
++#ifdef CONFIG_DEV_NS
++	put_dev_ns(client->dev_ns);
++#endif
+ 	mousedev_detach_client(mousedev, client);
+ 	kfree(client);
+ 
+@@ -573,6 +587,9 @@ static int mousedev_open(struct inode *inode, struct file *file)
+ 	client->pos_x = xres / 2;
+ 	client->pos_y = yres / 2;
+ 	client->mousedev = mousedev;
++#ifdef CONFIG_DEV_NS
++	client->dev_ns = get_dev_ns(current_dev_ns());
++#endif
+ 	mousedev_attach_client(mousedev, client);
+ 
+ 	error = mousedev_open_device(mousedev);
+@@ -583,6 +600,9 @@ static int mousedev_open(struct inode *inode, struct file *file)
+ 	return 0;
+ 
+  err_free_client:
++#ifdef CONFIG_DEV_NS
++	put_dev_ns(client->dev_ns);
++#endif
+ 	mousedev_detach_client(mousedev, client);
+ 	kfree(client);
+  err_put_mousedev:

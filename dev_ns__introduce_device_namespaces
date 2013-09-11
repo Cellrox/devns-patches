@@ -13,6 +13,7 @@ driver, but not the device.
 Changelog:
 [11-Sep-2014] v2 - fix compile and crashes with !CONFIG_DEV_NS
   - replace reference of pid_ns with pid_t in dev_ns [report: Jeremy Andrus]
+  - fix compile errors when !COFNIG_DEV_NS [report: Jeremy Andrus)]
 [16-Aug-2013] v1 - initial version
 
 Change-Id: I38ef9fdf76086794d42679f4ec05612ba0cfb179
@@ -20,20 +21,20 @@ Signed-off-by: Oren Laadan <orenl@cellrox.com>
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 
 ---
- include/linux/dev_namespace.h | 247 ++++++++++++++++
+ include/linux/dev_namespace.h | 255 ++++++++++++++++
  include/linux/nsproxy.h       |   1 +
  init/Kconfig                  |  10 +
  kernel/Makefile               |   1 +
  kernel/dev_namespace.c        | 657 ++++++++++++++++++++++++++++++++++++++++++
  kernel/nsproxy.c              |  13 +
- 6 files changed, 929 insertions(+)
+ 6 files changed, 937 insertions(+)
 
 diff --git a/include/linux/dev_namespace.h b/include/linux/dev_namespace.h
 new file mode 100644
-index 0000000..f9aac31
+index 0000000..77e0083
 --- /dev/null
 +++ b/include/linux/dev_namespace.h
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,255 @@
 +/*
 + * include/linux/dev_namespace.h
 + *
@@ -239,6 +240,9 @@ index 0000000..f9aac31
 +/* appease static assignment in kernel/nsproxy.c */
 +#define init_dev_ns (*(struct dev_namespace *) NULL)
 +
++static inline void put_dev_ns(struct dev_namespace *dev_ns)
++{ /* nothing */ }
++
 +/*
 + * Driver authors should use this macro instead if !CONFIG_DEV_NS:
 + * DEFINE_DEV_NS_INIT(X): put_X_ns(), get_X_ns(), get_X_ns_cur()
@@ -266,12 +270,17 @@ index 0000000..f9aac31
 +	return task->nsproxy->dev_ns;
 +}
 +
++static inline bool is_active_dev_ns(struct dev_namespace *dev_ns)
++{
++	return true;
++}
++
 +static inline pid_t dev_ns_init_pid(struct dev_namespace *dev_ns)
 +{
 +	return init_task.pid;
 +}
 +
-+static inline get_dev_ns_tag(char *to, struct dev_namespace *dev_ns)
++static inline void get_dev_ns_tag(char *to, struct dev_namespace *dev_ns)
 +{
 +	strcpy(to, "");
 +}

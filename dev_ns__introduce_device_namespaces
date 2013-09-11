@@ -13,7 +13,8 @@ driver, but not the device.
 Changelog:
 [11-Sep-2014] v2 - fix compile and crashes with !CONFIG_DEV_NS
   - replace reference of pid_ns with pid_t in dev_ns [report: Jeremy Andrus]
-  - fix compile errors when !COFNIG_DEV_NS [report: Jeremy Andrus)]
+  - fix compile errors when !COFNIG_DEV_NS [report: Jeremy Andrus]
+  - fix kernel crash when !CONFIG_DEV_NS [report: Jeremy Andrus]
 [16-Aug-2013] v1 - initial version
 
 Change-Id: I38ef9fdf76086794d42679f4ec05612ba0cfb179
@@ -21,20 +22,20 @@ Signed-off-by: Oren Laadan <orenl@cellrox.com>
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 
 ---
- include/linux/dev_namespace.h | 255 ++++++++++++++++
+ include/linux/dev_namespace.h | 268 +++++++++++++++++
  include/linux/nsproxy.h       |   1 +
  init/Kconfig                  |  10 +
  kernel/Makefile               |   1 +
  kernel/dev_namespace.c        | 657 ++++++++++++++++++++++++++++++++++++++++++
  kernel/nsproxy.c              |  13 +
- 6 files changed, 937 insertions(+)
+ 6 files changed, 950 insertions(+)
 
 diff --git a/include/linux/dev_namespace.h b/include/linux/dev_namespace.h
 new file mode 100644
-index 0000000..77e0083
+index 0000000..9fa3835
 --- /dev/null
 +++ b/include/linux/dev_namespace.h
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,268 @@
 +/*
 + * include/linux/dev_namespace.h
 + *
@@ -128,6 +129,12 @@ index 0000000..77e0083
 +static inline bool is_active_dev_ns(struct dev_namespace *dev_ns)
 +{
 +	return dev_ns->active;
++}
++
++/* return whether given device namespace is init dev_ns */
++static inline bool is_init_dev_ns(struct dev_namespace *dev_ns)
++{
++	return dev_ns == &init_dev_ns;
 +}
 +
 +/* return and get the device namespace of a given task */
@@ -260,7 +267,9 @@ index 0000000..77e0083
 +	{ /* */ }
 +
 +static inline struct dev_namespace *current_dev_ns(void)
-+{ return &init_dev_ns; }
++{
++	return &init_dev_ns;
++}
 +
 +static inline struct dev_namespace *copy_dev_ns(unsigned long flags,
 +						struct task_struct *task)
@@ -271,6 +280,11 @@ index 0000000..77e0083
 +}
 +
 +static inline bool is_active_dev_ns(struct dev_namespace *dev_ns)
++{
++	return true;
++}
++
++static inline bool is_init_dev_ns(struct dev_namespace *dev_ns)
 +{
 +	return true;
 +}

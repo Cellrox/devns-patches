@@ -9,14 +9,21 @@ should be read. This is useful to allow host to filter events from specific
 namespace when reading from /dev/log/events.
 
 Changelog:
+[11-Sep-2013] v2 - fix compile and crashes with !CONFIG_DEV_NS
+  fix crash when !COFNIG_DEV_NS [report: Jeremy Andrus]
 [16-Aug-2013] v1 - initial version
 
 Change-Id: I09d4c5009c18d94d69cdd785e46c76d756477767
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 
+---
+ drivers/staging/android/logger.c | 130 +++++++++++++++++++++++++++++++--------
+ drivers/staging/android/logger.h |  36 ++++++++++-
+ 2 files changed, 139 insertions(+), 27 deletions(-)
+
 diff --git a/drivers/staging/android/logger.c b/drivers/staging/android/logger.c
-index eb3d4ca..d43e516 100644
+index eb3d4ca..c606dad 100644
 --- a/drivers/staging/android/logger.c
 +++ b/drivers/staging/android/logger.c
 @@ -25,6 +25,7 @@
@@ -157,19 +164,15 @@ index eb3d4ca..d43e516 100644
  	size_t orig = log->w_off;
  	struct logger_entry header;
  	struct timespec now;
-@@ -454,8 +484,17 @@ ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
+@@ -454,8 +484,13 @@ ssize_t logger_aio_write(struct kiocb *iocb, const struct iovec *iov,
  
  	now = current_kernel_time();
  
 -	header.pid = current->tgid;
 -	header.tid = current->pid;
-+	BUG_ON(!dev_ns);
-+
 +	header.ns_initpid = dev_ns_init_pid(dev_ns);
-+	if (header.ns_initpid > 1)
-+		strncpy(header.ns_tag, dev_ns->tag, DEV_NS_TAG_LEN);
-+	else
-+		header.ns_tag[0] = '\0';
++	get_dev_ns_tag(header.ns_tag, dev_ns);
++
 +	header.ns_pid = task_tgid_nr(current);
 +	header.ns_tid = task_pid_nr(current);
 +	header.pid = task_tgid_vnr(current);
@@ -177,15 +180,13 @@ index eb3d4ca..d43e516 100644
  	header.sec = now.tv_sec;
  	header.nsec = now.tv_nsec;
  	header.euid = current_euid();
-@@ -527,16 +566,33 @@ static int logger_open(struct inode *inode, struct file *file)
+@@ -527,16 +562,31 @@ static int logger_open(struct inode *inode, struct file *file)
  
  	if (file->f_mode & FMODE_READ) {
  		struct logger_reader *reader;
 +		struct dev_namespace *dev_ns = current_dev_ns();
 +
-+		BUG_ON(!dev_ns);
-+
-+		if (file->f_flags & O_DIRECT && dev_ns != &init_dev_ns)
++		if (file->f_flags & O_DIRECT && !is_init_dev_ns(dev_ns))
 +			return -EPERM;
  
  		reader = kmalloc(sizeof(struct logger_reader), GFP_KERNEL);
@@ -212,7 +213,7 @@ index eb3d4ca..d43e516 100644
  		INIT_LIST_HEAD(&reader->list);
  
  		mutex_lock(&log->mutex);
-@@ -596,9 +652,9 @@ static unsigned int logger_poll(struct file *file, poll_table *wait)
+@@ -596,9 +646,9 @@ static unsigned int logger_poll(struct file *file, poll_table *wait)
  	poll_wait(file, &log->wq, wait);
  
  	mutex_lock(&log->mutex);
@@ -225,7 +226,7 @@ index eb3d4ca..d43e516 100644
  
  	if (log->w_off != reader->r_off)
  		ret |= POLLIN | POLLRDNORM;
-@@ -616,7 +672,11 @@ static long logger_set_version(struct logger_reader *reader, void __user *arg)
+@@ -616,7 +666,11 @@ static long logger_set_version(struct logger_reader *reader, void __user *arg)
  	if ((version < 1) || (version > 2))
  		return -EINVAL;
  
@@ -238,7 +239,7 @@ index eb3d4ca..d43e516 100644
  	return 0;
  }
  
-@@ -651,9 +711,10 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+@@ -651,9 +705,10 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  		}
  		reader = file->private_data;
  
@@ -252,7 +253,7 @@ index eb3d4ca..d43e516 100644
  
  		if (log->w_off != reader->r_off)
  			ret = get_user_hdr_len(reader->r_ver) +
-@@ -677,7 +738,7 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+@@ -677,7 +732,7 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  			break;
  		}
  		reader = file->private_data;
@@ -261,7 +262,7 @@ index eb3d4ca..d43e516 100644
  		break;
  	case LOGGER_SET_VERSION:
  		if (!(file->f_mode & FMODE_READ)) {
-@@ -687,6 +748,29 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+@@ -687,6 +742,29 @@ static long logger_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  		reader = file->private_data;
  		ret = logger_set_version(reader, argp);
  		break;
@@ -270,7 +271,7 @@ index eb3d4ca..d43e516 100644
 +			ret = -EBADF;
 +			break;
 +		}
-+		if (current_dev_ns() != &init_dev_ns) {
++		if (!is_init_dev_ns(current_dev_ns())) {
 +			ret = -EPERM;
 +			break;
 +		}
@@ -292,7 +293,7 @@ index eb3d4ca..d43e516 100644
  
  	mutex_unlock(&log->mutex);
 diff --git a/drivers/staging/android/logger.h b/drivers/staging/android/logger.h
-index 3f612a3..3607aeb 100644
+index 3f612a3b..3607aeb 100644
 --- a/drivers/staging/android/logger.h
 +++ b/drivers/staging/android/logger.h
 @@ -25,7 +25,7 @@

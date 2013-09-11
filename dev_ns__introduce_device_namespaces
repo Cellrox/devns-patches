@@ -11,15 +11,26 @@ inactive containers should be able to communicate gracefully with the device
 driver, but not the device.
 
 Changelog:
+[11-Sep-2014] v2 - fix compile and crashes with !CONFIG_DEV_NS
+  - replace reference of pid_ns with pid_t in dev_ns [report: Jeremy Andrus]
 [16-Aug-2013] v1 - initial version
 
 Change-Id: I38ef9fdf76086794d42679f4ec05612ba0cfb179
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 
+---
+ include/linux/dev_namespace.h | 247 ++++++++++++++++
+ include/linux/nsproxy.h       |   1 +
+ init/Kconfig                  |  10 +
+ kernel/Makefile               |   1 +
+ kernel/dev_namespace.c        | 657 ++++++++++++++++++++++++++++++++++++++++++
+ kernel/nsproxy.c              |  13 +
+ 6 files changed, 929 insertions(+)
+
 diff --git a/include/linux/dev_namespace.h b/include/linux/dev_namespace.h
 new file mode 100644
-index 0000000..7b26e90
+index 0000000..f9aac31
 --- /dev/null
 +++ b/include/linux/dev_namespace.h
 @@ -0,0 +1,247 @@
@@ -61,7 +72,7 @@ index 0000000..7b26e90
 +
 +	bool active;
 +	atomic_t count;
-+	struct pid_namespace *pid_ns;
++	pid_t init_pid;
 +	char tag[DEV_NS_TAG_LEN + 1];
 +	struct blocking_notifier_head notifiers;
 +	unsigned long timestamp; /* jiffies */
@@ -134,7 +145,7 @@ index 0000000..7b26e90
 +/* return root pid of the init process in a device namespace */
 +static inline pid_t dev_ns_init_pid(struct dev_namespace *dev_ns)
 +{
-+	return dev_ns->pid_ns->child_reaper->pid;
++	return dev_ns->init_pid;
 +}
 +
 +/* device namespaces: notifiers (de)registration */
@@ -317,10 +328,10 @@ index cb41b95..e3f4aab 100644
  obj-$(CONFIG_SMP) += stop_machine.o
 diff --git a/kernel/dev_namespace.c b/kernel/dev_namespace.c
 new file mode 100644
-index 0000000..9cf578d
+index 0000000..3fdce37
 --- /dev/null
 +++ b/kernel/dev_namespace.c
-@@ -0,0 +1,637 @@
+@@ -0,0 +1,657 @@
 +/*
 + * kernel/dev_namespace.c
 + *
@@ -378,7 +389,7 @@ index 0000000..9cf578d
 +struct dev_namespace init_dev_ns = {
 +	.active = true,
 +	.count = ATOMIC_INIT(2),  /* extra reference for active_dev_ns */
-+	.pid_ns = &init_pid_ns,
++	.init_pid = 1,
 +	.notifiers = BLOCKING_NOTIFIER_INIT(init_dev_ns.notifiers),
 +	.timestamp = 0,
 +	.mutex = __MUTEX_INITIALIZER(init_dev_ns.mutex),
@@ -399,7 +410,7 @@ index 0000000..9cf578d
 +	mutex_unlock(&dev_ns->mutex);
 +}
 +
-+static struct dev_namespace *create_dev_ns(struct task_struct *task)
++static struct dev_namespace *create_dev_ns(void)
 +{
 +	struct dev_namespace *dev_ns;
 +
@@ -411,7 +422,11 @@ index 0000000..9cf578d
 +	BLOCKING_INIT_NOTIFIER_HEAD(&dev_ns->notifiers);
 +	mutex_init(&dev_ns->mutex);
 +
-+	dev_ns->pid_ns = get_pid_ns(task->nsproxy->pid_ns);
++	/*
++	 * The pid is yet unknown, so init_pid will remain zero until
++	 * a dev_ns is accessed for the first time by get_dev_ns_by_xxx()
++	 * or new_dev_ns_info() functions.
++	 */
 +
 +	return dev_ns;
 +}
@@ -428,15 +443,31 @@ index 0000000..9cf578d
 +	if (!(flags & CLONE_NEWPID))
 +		return get_dev_ns(dev_ns);
 +	else
-+		return create_dev_ns(task);
++		return create_dev_ns();
++}
++
++static void lazy_set_dev_ns_init_pid(struct nsproxy *nsproxy)
++{
++	/*
++	 * dev_ns->init_pid is set here, lazily, because it was
++	 * not known at creation time in copy_dev_ns() - see above.
++	 */
++	if (unlikely(nsproxy->dev_ns->init_pid == 0))
++		nsproxy->dev_ns->init_pid = nsproxy->pid_ns->child_reaper->pid;
 +}
 +
 +void __put_dev_ns(struct dev_namespace *dev_ns)
 +{
-+	if (dev_ns) {
-+		put_pid_ns(dev_ns->pid_ns);
-+		kfree(dev_ns);
-+	}
++	kfree(dev_ns);
++}
++
++static struct dev_namespace *get_dev_ns_from_nsproxy(struct nsproxy *nsproxy)
++{
++	if (nsproxy) {
++		lazy_set_dev_ns_init_pid(nsproxy);
++		return get_dev_ns(nsproxy->dev_ns);
++	} else
++		return NULL;
 +}
 +
 +struct dev_namespace *get_dev_ns_by_task(struct task_struct *task)
@@ -446,8 +477,7 @@ index 0000000..9cf578d
 +
 +	rcu_read_lock();
 +	nsproxy = task_nsproxy(task);
-+	if (nsproxy)
-+		dev_ns = get_dev_ns(nsproxy->dev_ns);
++	dev_ns = get_dev_ns_from_nsproxy(nsproxy);
 +	rcu_read_unlock();
 +
 +	return dev_ns;
@@ -463,8 +493,7 @@ index 0000000..9cf578d
 +	task = find_task_by_pid_ns(vpid, &init_pid_ns);
 +	if (task) {
 +		nsproxy = task_nsproxy(task);
-+		if (nsproxy)
-+			dev_ns = get_dev_ns(nsproxy->dev_ns);
++		dev_ns = get_dev_ns_from_nsproxy(nsproxy);
 +	}
 +	rcu_read_unlock();
 +
@@ -572,6 +601,8 @@ index 0000000..9cf578d
 +	struct dev_ns_info *dev_ns_info;
 +
 +	pr_debug("dev_ns: [0x%p] new info %s\n", dev_ns, desc->name);
++
++	lazy_set_dev_ns_init_pid(current->nsproxy);
 +
 +	dev_ns_info = desc->ops->create(dev_ns);
 +	if (!dev_ns_info)
@@ -959,7 +990,7 @@ index 0000000..9cf578d
 +
 +device_initcall(dev_namespace_init);
 diff --git a/kernel/nsproxy.c b/kernel/nsproxy.c
-index b576f7f..08f1fb4 100644
+index b576f7f..fee38a0 100644
 --- a/kernel/nsproxy.c
 +++ b/kernel/nsproxy.c
 @@ -22,6 +22,7 @@
@@ -978,7 +1009,7 @@ index b576f7f..08f1fb4 100644
  };
  
  static inline struct nsproxy *create_nsproxy(void)
-@@ -96,8 +98,19 @@ static struct nsproxy *create_new_namespaces(unsigned long flags,
+@@ -96,8 +98,17 @@ static struct nsproxy *create_new_namespaces(unsigned long flags,
  		goto out_net;
  	}
  
@@ -988,8 +1019,6 @@ index b576f7f..08f1fb4 100644
 +		goto out_dev;
 +	}
 +
-+	new_nsp->dev_ns->pid_ns = new_nsp->pid_ns;
-+
  	return new_nsp;
  
 +out_dev:
@@ -998,7 +1027,7 @@ index b576f7f..08f1fb4 100644
  out_net:
  	if (new_nsp->pid_ns)
  		put_pid_ns(new_nsp->pid_ns);
-@@ -175,6 +188,8 @@ void free_nsproxy(struct nsproxy *ns)
+@@ -175,6 +186,8 @@ void free_nsproxy(struct nsproxy *ns)
  	if (ns->pid_ns)
  		put_pid_ns(ns->pid_ns);
  	put_net(ns->net_ns);

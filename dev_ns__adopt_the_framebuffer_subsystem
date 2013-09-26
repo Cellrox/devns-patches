@@ -28,11 +28,11 @@ Signed-off-by: Oren Laadan <orenl@cellrox.com>
 ---
  drivers/video/Kconfig    |   48 ++
  drivers/video/Makefile   |    1 +
- drivers/video/fb_devns.c | 1247 ++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/video/fb_devns.c | 1251 ++++++++++++++++++++++++++++++++++++++++++++++
  drivers/video/fbmem.c    |   82 ++-
  include/linux/fb.h       |    3 +
  include/linux/fb_devns.h |   43 ++
- 6 files changed, 1415 insertions(+), 9 deletions(-)
+ 6 files changed, 1419 insertions(+), 9 deletions(-)
 
 diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
 index 527422b..a5fd2cd 100644
@@ -107,10 +107,10 @@ index 53166e9..2f36714 100644
  obj-$(CONFIG_VT)		  += console/
 diff --git a/drivers/video/fb_devns.c b/drivers/video/fb_devns.c
 new file mode 100644
-index 0000000..8a5828c
+index 0000000..bdb57e2
 --- /dev/null
 +++ b/drivers/video/fb_devns.c
-@@ -0,0 +1,1247 @@
+@@ -0,0 +1,1251 @@
 +/*
 + * drivers/video/fb_devns.c
 + *
@@ -1031,6 +1031,10 @@ index 0000000..8a5828c
 +
 +	pr_info("fb_info 0x%p idx %d copy %s virtual buffer (size 0x%zx)\n",
 +		info, info->node, activate ? "from" : "to", size);
++
++	/* do nothing for zero size framebuffers */
++	if (size == 0 || !info->screen_base || !virt->screen_base)
++		return;
 +
 +	/* follow logic in fb_read()/fb_write() */
 +	if (info->fbops->fb_sync)

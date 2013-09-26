@@ -22,8 +22,13 @@ Change-Id: Ie6a6d192cfaabeb7b06cc5d12a5ac0576c4a45d0
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 
+---
+ drivers/input/evdev.c    | 275 +++++++++++++++++++++++++++++++++++++++++++++--
+ drivers/input/mousedev.c |  20 ++++
+ 2 files changed, 289 insertions(+), 6 deletions(-)
+
 diff --git a/drivers/input/evdev.c b/drivers/input/evdev.c
-index a937438..ef46708 100644
+index a937438..b452b64 100644
 --- a/drivers/input/evdev.c
 +++ b/drivers/input/evdev.c
 @@ -8,7 +8,23 @@
@@ -86,7 +91,7 @@ index a937438..ef46708 100644
  	struct fasync_struct *fasync;
  	struct evdev *evdev;
  	struct list_head node;
-@@ -58,6 +87,162 @@ struct evdev_client {
+@@ -58,6 +87,161 @@ struct evdev_client {
  static struct evdev *evdev_table[EVDEV_MINORS];
  static DEFINE_MUTEX(evdev_table_mutex);
  
@@ -147,8 +152,7 @@ index a937438..ef46708 100644
 +	dev_ns_info->nb = evdev_ns_switch_notifier;
 +	dev_ns_register_notify(dev_ns, &dev_ns_info->nb);
 +
-+	return &evdev_ns->dev_ns_info;
-+
++	return dev_ns_info;
 +}
 +
 +static void evdev_devns_release(struct dev_ns_info *dev_ns_info)
@@ -205,7 +209,7 @@ index a937438..ef46708 100644
 +	put_evdev_ns(evdev_ns);
 +}
 +
-+/* dev_ns and resepctive fb_dev_ns protected by caller */
++/* dev_ns and respective fb_dev_ns protected by caller */
 +static int evdev_ns_switch_callback(struct notifier_block *self,
 +				    unsigned long action, void *data)
 +{
@@ -249,7 +253,7 @@ index a937438..ef46708 100644
  static void evdev_pass_event(struct evdev_client *client,
  			     struct input_event *event,
  			     ktime_t mono, ktime_t real)
-@@ -123,8 +308,13 @@ static void evdev_event(struct input_handle *handle,
+@@ -123,8 +307,13 @@ static void evdev_event(struct input_handle *handle,
  	if (client)
  		evdev_pass_event(client, &event, time_mono, time_real);
  	else
@@ -264,7 +268,7 @@ index a937438..ef46708 100644
  
  	rcu_read_unlock();
  
-@@ -181,6 +371,9 @@ static int evdev_grab(struct evdev *evdev, struct evdev_client *client)
+@@ -181,6 +370,9 @@ static int evdev_grab(struct evdev *evdev, struct evdev_client *client)
  	if (error)
  		return error;
  
@@ -274,7 +278,7 @@ index a937438..ef46708 100644
  	rcu_assign_pointer(evdev->grab, client);
  
  	return 0;
-@@ -191,6 +384,9 @@ static int evdev_ungrab(struct evdev *evdev, struct evdev_client *client)
+@@ -191,6 +383,9 @@ static int evdev_ungrab(struct evdev *evdev, struct evdev_client *client)
  	if (evdev->grab != client)
  		return  -EINVAL;
  
@@ -284,7 +288,7 @@ index a937438..ef46708 100644
  	rcu_assign_pointer(evdev->grab, NULL);
  	synchronize_rcu();
  	input_release_device(&evdev->handle);
-@@ -271,6 +467,10 @@ static int evdev_release(struct inode *inode, struct file *file)
+@@ -271,6 +466,10 @@ static int evdev_release(struct inode *inode, struct file *file)
  		evdev_ungrab(evdev, client);
  	mutex_unlock(&evdev->mutex);
  
@@ -295,7 +299,7 @@ index a937438..ef46708 100644
  	evdev_detach_client(evdev, client);
  	if (client->use_wake_lock)
  		wake_lock_destroy(&client->wake_lock);
-@@ -325,22 +525,38 @@ static int evdev_open(struct inode *inode, struct file *file)
+@@ -325,22 +524,38 @@ static int evdev_open(struct inode *inode, struct file *file)
  
  	client->bufsize = bufsize;
  	spin_lock_init(&client->buffer_lock);
@@ -337,7 +341,7 @@ index a937438..ef46708 100644
  	kfree(client);
   err_put_evdev:
  	put_device(&evdev->dev);
-@@ -374,6 +590,10 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
+@@ -374,6 +589,10 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
  		}
  		retval += input_event_size();
  
@@ -348,7 +352,7 @@ index a937438..ef46708 100644
  		input_inject_event(&evdev->handle,
  				   event.type, event.code, event.value);
  	} while (retval + input_event_size() <= count);
-@@ -739,12 +959,20 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+@@ -739,12 +958,20 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
  		if (get_user(v, ip + 1))
  			return -EFAULT;
  
@@ -369,7 +373,7 @@ index a937438..ef46708 100644
  		return input_ff_erase(dev, (int)(unsigned long) p, file);
  
  	case EVIOCGEFFECTS:
-@@ -755,6 +983,15 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+@@ -755,6 +982,15 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
  		return 0;
  
  	case EVIOCGRAB:
@@ -385,7 +389,7 @@ index a937438..ef46708 100644
  		if (p)
  			return evdev_grab(evdev, client);
  		else
-@@ -772,6 +1009,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+@@ -772,6 +1008,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
  		return evdev_handle_get_keycode(dev, p);
  
  	case EVIOCSKEYCODE:
@@ -396,7 +400,7 @@ index a937438..ef46708 100644
  		return evdev_handle_set_keycode(dev, p);
  
  	case EVIOCGKEYCODE_V2:
-@@ -825,6 +1066,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+@@ -825,6 +1065,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
  		return str_to_user(dev->uniq, size, p);
  
  	case EVIOC_MASK_SIZE(EVIOCSFF):
@@ -407,7 +411,7 @@ index a937438..ef46708 100644
  		if (input_ff_effect_from_user(p, size, &effect))
  			return -EFAULT;
  
-@@ -865,6 +1110,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
+@@ -865,6 +1109,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
  
  	if (_IOC_DIR(cmd) == _IOC_WRITE) {
  
@@ -418,7 +422,7 @@ index a937438..ef46708 100644
  		if ((_IOC_NR(cmd) & ~ABS_MAX) == _IOC_NR(EVIOCSABS(0))) {
  
  			if (!dev->absinfo)
-@@ -1094,11 +1343,26 @@ static struct input_handler evdev_handler = {
+@@ -1094,11 +1342,26 @@ static struct input_handler evdev_handler = {
  
  static int __init evdev_init(void)
  {

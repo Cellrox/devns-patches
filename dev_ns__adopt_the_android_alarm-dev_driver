@@ -18,6 +18,10 @@ Change-Id: I968989e23268d9510f40cf90b7c3366c03d4a226
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 
+---
+ drivers/staging/android/alarm-dev.c | 315 +++++++++++++++++++++++++++---------
+ 1 file changed, 236 insertions(+), 79 deletions(-)
+
 diff --git a/drivers/staging/android/alarm-dev.c b/drivers/staging/android/alarm-dev.c
 index e001fe5..ff2505b 100644
 --- a/drivers/staging/android/alarm-dev.c

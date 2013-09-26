@@ -9,6 +9,10 @@ Changelog:
 Change-Id: I7efbf17c9ef102b9b167b4fdec867bd76023f0bd
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 
+---
+ drivers/leds/led-class.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
 diff --git a/drivers/leds/led-class.c b/drivers/leds/led-class.c
 index 5bff843..d1c9f22 100644
 --- a/drivers/leds/led-class.c

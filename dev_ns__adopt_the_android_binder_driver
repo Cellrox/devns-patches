@@ -18,6 +18,10 @@ Changelog:
 Change-Id: Idac7e12eba602dbd2534b5ce9f86c36ac2ec3e0f
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 
+---
+ drivers/staging/android/binder.c | 235 +++++++++++++++++++++++++++++++--------
+ 1 file changed, 187 insertions(+), 48 deletions(-)
+
 diff --git a/drivers/staging/android/binder.c b/drivers/staging/android/binder.c
 index f1364a8..21d8537 100644
 --- a/drivers/staging/android/binder.c

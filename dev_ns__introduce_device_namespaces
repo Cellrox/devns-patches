@@ -22,20 +22,20 @@ Signed-off-by: Oren Laadan <orenl@cellrox.com>
 Signed-off-by: Amir Goldstein <amir@cellrox.com>
 
 ---
- include/linux/dev_namespace.h | 268 +++++++++++++++++
+ include/linux/dev_namespace.h | 269 +++++++++++++++++
  include/linux/nsproxy.h       |   1 +
  init/Kconfig                  |  10 +
  kernel/Makefile               |   1 +
- kernel/dev_namespace.c        | 657 ++++++++++++++++++++++++++++++++++++++++++
+ kernel/dev_namespace.c        | 659 ++++++++++++++++++++++++++++++++++++++++++
  kernel/nsproxy.c              |  13 +
- 6 files changed, 950 insertions(+)
+ 6 files changed, 953 insertions(+)
 
 diff --git a/include/linux/dev_namespace.h b/include/linux/dev_namespace.h
 new file mode 100644
-index 0000000..9fa3835
+index 0000000..1809e6a
 --- /dev/null
 +++ b/include/linux/dev_namespace.h
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,269 @@
 +/*
 + * include/linux/dev_namespace.h
 + *
@@ -255,10 +255,11 @@ index 0000000..9fa3835
 + * DEFINE_DEV_NS_INIT(X): put_X_ns(), get_X_ns(), get_X_ns_cur()
 + */
 +#define DEFINE_DEV_NS_INIT(x) \
-+	struct x ## _dev_ns init_ ## x ## _ns; \
++	static struct x ## _dev_ns init_ ## x ## _ns; \
 +	static inline \
 +	struct x ## _dev_ns *find_ ## x ## _ns(struct dev_namespace *dev_ns) \
 +	{ return &init_ ## x ## _ns; } \
++	static inline \
 +	struct x ## _dev_ns *get_ ## x ## _ns(struct dev_namespace *dev_ns) \
 +	{ return &init_ ## x ## _ns; } \
 +	static inline struct x ## _dev_ns *get_ ## x ## _ns_cur(void) \
@@ -351,10 +352,10 @@ index cb41b95..e3f4aab 100644
  obj-$(CONFIG_SMP) += stop_machine.o
 diff --git a/kernel/dev_namespace.c b/kernel/dev_namespace.c
 new file mode 100644
-index 0000000..3fdce37
+index 0000000..bd57a7f
 --- /dev/null
 +++ b/kernel/dev_namespace.c
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,659 @@
 +/*
 + * kernel/dev_namespace.c
 + *
@@ -363,21 +364,23 @@ index 0000000..3fdce37
 + * General Public License Version 2 (GPL 2). You can distribute it and/or
 + * modify it under the terms of the GPL 2.
 + *
++ * Based on device_namespace.c by Jeremy C. Andrus <jeremya@cs.columbia.edu>
++ * and Christoffer Dall <cdall@cs.columbia.edu>.
 + *
 + * Device namespaces:
 + *
-+ * The idea with a device namespace comes from the Android-Cells project where
-+ * namespaces are utilized to create a container-like environment on Linux, only
-+ * where there's a notion of an 'active' namespace and all other namespaces are
-+ * inactive. In such a case only processes residing within the active device
++ * The idea with a device namespace comes from the Android-Cells project:
++ * namespaces are utilized to create a container-like environment on Linux,
++ * and there is a notion of an 'active' namespace while other namespaces are
++ * non-active. In such a case only processes residing within the active device
 + * namespace should communicate with actual devices, where processes inside
-+ * inactive containers should be able to communicate gracefully with the device
-+ * driver, but not the device.
++ * non-active containers should be able to communicate gracefully with the
++ * device driver, but not the device.
 + *
 + * The device namespace allows a device driver to register itself and pass a
 + * pointer to its device specific namespace structure and register notifiers
-+ * which are called when the active namepace becomes inactive and when an
-+ * inactive namespace becomes active.
++ * which are called when the active namepace becomes non-active and when an
++ * non-active namespace becomes active.
 + *
 + *
 + * This program is distributed in the hope that it will be useful, but WITHOUT

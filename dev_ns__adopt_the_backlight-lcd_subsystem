@@ -10,6 +10,11 @@ Changelog:
 Change-Id: Ib1b68a50240ca6116620eed74e31407c7b9d1bd4
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 
+---
+ drivers/video/backlight/backlight.c | 21 +++++++++++++++++++++
+ drivers/video/backlight/lcd.c       | 17 +++++++++++++++++
+ 2 files changed, 38 insertions(+)
+
 diff --git a/drivers/video/backlight/backlight.c b/drivers/video/backlight/backlight.c
 index bf5b1ec..1b95c8d 100644
 --- a/drivers/video/backlight/backlight.c

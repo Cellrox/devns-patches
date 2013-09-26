@@ -25,6 +25,15 @@ Changelog:
 Change-Id: I4d9065a27c12be5da872643009002c5f9c905428
 Signed-off-by: Oren Laadan <orenl@cellrox.com>
 
+---
+ drivers/video/Kconfig    |   48 ++
+ drivers/video/Makefile   |    1 +
+ drivers/video/fb_devns.c | 1247 ++++++++++++++++++++++++++++++++++++++++++++++
+ drivers/video/fbmem.c    |   82 ++-
+ include/linux/fb.h       |    3 +
+ include/linux/fb_devns.h |   43 ++
+ 6 files changed, 1415 insertions(+), 9 deletions(-)
+
 diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
 index 527422b..a5fd2cd 100644
 --- a/drivers/video/Kconfig
@@ -98,10 +107,10 @@ index 53166e9..2f36714 100644
  obj-$(CONFIG_VT)		  += console/
 diff --git a/drivers/video/fb_devns.c b/drivers/video/fb_devns.c
 new file mode 100644
-index 0000000..bf1cbec
+index 0000000..8a5828c
 --- /dev/null
 +++ b/drivers/video/fb_devns.c
-@@ -0,0 +1,1245 @@
+@@ -0,0 +1,1247 @@
 +/*
 + * drivers/video/fb_devns.c
 + *
@@ -109,6 +118,8 @@ index 0000000..bf1cbec
 + * Columbia University. This program is free software licensed under the GNU
 + * General Public License Version 2 (GPL 2). You can distribute it and/or
 + * modify it under the terms of the GPL 2.
++ *
++ * Based on mux_fb.c by Jeremy C. Andrus <jeremya@cs.columbia.edu>
 + *
 + *
 + * Framebuffer support for device namespace:
@@ -847,7 +858,7 @@ index 0000000..bf1cbec
 +
 +	pr_info("fb_mmap fb_info 0x%p idx %d\n", virt, virt->node);
 +	pr_info(" |-> addr 0x%p vm_start 0x%lx vm_size 0x%lx vm_pgoff 0x%lx\n",
-+		vma->vm_start, vma->vm_end - vma->vm_start, vma->vm_pgoff);
++		addr, vma->vm_start, vma->vm_end-vma->vm_start, vma->vm_pgoff);
 +
 +	return remap_vmalloc_range(vma, addr, vma->vm_pgoff);
 +}
@@ -1220,7 +1231,7 @@ index 0000000..bf1cbec
 +	return 0;
 +}
 +
-+/* dev_ns and resepctive fb_dev_ns protected (by caller) */
++/* dev_ns and respective fb_dev_ns protected (by caller) */
 +static int fb_activate_ns(struct dev_namespace *dev_ns, bool activate)
 +{
 +	struct fb_dev_ns *fb_ns;
@@ -1250,7 +1261,7 @@ index 0000000..bf1cbec
 +	return err;
 +}
 +
-+/* dev_ns and resepctive fb_dev_ns protected by caller */
++/* dev_ns and respective fb_dev_ns protected by caller */
 +static int fb_ns_switch_callback(struct notifier_block *self,
 +				 unsigned long action, void *data)
 +{
